@@ -27,6 +27,13 @@ from rp_losses import safe_supcon_loss, symmetric_consistency_loss
 
 USE_RP = True
 RP_FEATURE_DIM = 288
+RP_WARMUP_EPOCHS = 20
+RP_THRESHOLD_START = 0.55
+RP_THRESHOLD_END = 0.90
+RP_LMMD_WEIGHT = 0.005
+RP_TARGET_CON_WEIGHT = 0.5
+RP_PROTO_WEIGHT = 0.05
+RP_CONSISTENCY_WEIGHT = 0.05
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
@@ -113,6 +120,9 @@ for iDataSet in range(nDataSet):
     loss3 = []
 
     for epoch in range(1, epochs + 1):
+        rp_active = USE_RP and epoch > RP_WARMUP_EPOCHS
+        rp_epoch = max(epoch - RP_WARMUP_EPOCHS, 1)
+        rp_epochs = max(epochs - RP_WARMUP_EPOCHS, 1)
         LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
         print('learning rate{: .4f}'.format(LEARNING_RATE))
         optimizer = torch.optim.SGD([
@@ -165,7 +175,9 @@ for iDataSet in range(nDataSet):
                     (_, _, _, _, _,
                      _, _, _, teacher_target_outputs, _) = teacher_encoder(source_data_cuda,target_data_cuda)
                     conf_t, pseudo_label_t, reliable_mask, prob_t = get_reliable_pseudo_labels(
-                        teacher_target_outputs, epoch, epochs
+                        teacher_target_outputs, rp_epoch, rp_epochs,
+                        threshold_start=RP_THRESHOLD_START,
+                        threshold_end=RP_THRESHOLD_END
                     )
             else:
                 softmax_output_t = nn.Softmax(dim=1)(target_outputs).detach()
@@ -180,10 +192,10 @@ for iDataSet in range(nDataSet):
             cls_loss = crossEntropy(source_outputs, source_label_cuda)
             # Loss Lmmd
             target_prob = F.softmax(target_outputs, dim=1)
-            if USE_RP:
+            if USE_RP and rp_active:
                 t_weight = conf_t * reliable_mask.float()
                 lmmd_loss = mmd.weighted_lmmd(source_features, target_features, source_label,
-                                             target_prob, t_weight=t_weight, BATCH_SIZE=BATCH_SIZE,
+                                             prob_t, t_weight=t_weight, BATCH_SIZE=BATCH_SIZE,
                                              CLASS_NUM=CLASS_NUM)
             else:
                 lmmd_loss = mmd.lmmd(source_features, target_features, source_label,
@@ -194,21 +206,28 @@ for iDataSet in range(nDataSet):
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
             if USE_RP:
-                contrastive_loss_t = safe_supcon_loss(
-                    ContrastiveLoss_t, all_target_con_features, pseudo_label_t, reliable_mask
-                )
                 source_memory.update(source_features.detach(), source_label_cuda)
-                target_memory.update(target_features.detach(), pseudo_label_t, reliable_mask)
-
-                proto_loss_s = prototype_contrastive_loss(
-                    source_features, source_label_cuda, source_memory.get(), temperature=0.1
-                )
-                proto_loss_t = prototype_contrastive_loss(
-                    target_features, pseudo_label_t, target_memory.get(), temperature=0.1, mask=reliable_mask
-                )
-                proto_loss = proto_loss_s + proto_loss_t
-                consistency_loss = symmetric_consistency_loss(target_outputs, teacher_target_outputs)
                 reliable_ratio = reliable_mask.float().mean().item()
+                if rp_active:
+                    contrastive_loss_t = safe_supcon_loss(
+                        ContrastiveLoss_t, all_target_con_features, pseudo_label_t, reliable_mask
+                    )
+                    target_memory.update(target_features.detach(), pseudo_label_t, reliable_mask)
+
+                    proto_loss_s = prototype_contrastive_loss(
+                        source_features, source_label_cuda, source_memory.get(), temperature=0.1
+                    )
+                    proto_loss_t = prototype_contrastive_loss(
+                        target_features, pseudo_label_t, target_memory.get(), temperature=0.1, mask=reliable_mask
+                    )
+                    proto_loss = proto_loss_s + proto_loss_t
+                    consistency_loss = symmetric_consistency_loss(
+                        target_outputs, teacher_target_outputs, mask=reliable_mask
+                    )
+                else:
+                    contrastive_loss_t = source_features.new_tensor(0.0)
+                    proto_loss = source_features.new_tensor(0.0)
+                    consistency_loss = source_features.new_tensor(0.0)
             else:
                 contrastive_loss_t = ContrastiveLoss_t(all_target_con_features, pseudo_label_t)
                 proto_loss = source_features.new_tensor(0.0)
@@ -220,12 +239,12 @@ for iDataSet in range(nDataSet):
             if USE_RP:
                 loss = (
                     cls_loss
-                    + 0.01 * lambd * lmmd_loss
+                    + (RP_LMMD_WEIGHT if rp_active else 0.01) * lambd * lmmd_loss
                     + contrastive_loss_s
-                    + contrastive_loss_t
+                    + RP_TARGET_CON_WEIGHT * contrastive_loss_t
                     + domain_similar_loss
-                    + 0.2 * proto_loss
-                    + 0.1 * consistency_loss
+                    + RP_PROTO_WEIGHT * proto_loss
+                    + RP_CONSISTENCY_WEIGHT * consistency_loss
                 )
             else:
                 loss = cls_loss + 0.01 * lambd * lmmd_loss + contrastive_loss_s + contrastive_loss_t + domain_similar_loss
