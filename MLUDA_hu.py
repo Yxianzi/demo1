@@ -23,17 +23,15 @@ from sklearn import svm
 from UtilsCMS import *
 from rp_utils import update_ema_teacher, get_reliable_pseudo_labels
 from prototype_memory import PrototypeMemory, prototype_contrastive_loss
-from rp_losses import safe_supcon_loss, symmetric_consistency_loss
 
 USE_RP = True
 RP_FEATURE_DIM = 288
-RP_WARMUP_EPOCHS = 20
-RP_THRESHOLD_START = 0.55
-RP_THRESHOLD_END = 0.90
-RP_LMMD_WEIGHT = 0.005
-RP_TARGET_CON_WEIGHT = 0.5
-RP_PROTO_WEIGHT = 0.05
-RP_CONSISTENCY_WEIGHT = 0.05
+RP_WARMUP_EPOCHS = 30
+RP_THRESHOLD_START = 0.50
+RP_THRESHOLD_END = 0.80
+RP_PROTO_WEIGHT = 0.01
+RP_MIN_RELIABLE_SAMPLES = 4
+RP_EVAL_INTERVAL = 10
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
@@ -82,7 +80,7 @@ for iDataSet in range(nDataSet):
     train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     train_loader_t = DataLoader(test_dataset,batch_size=BATCH_SIZE,shuffle=True,drop_last=True)
-    test_loader = DataLoader(test_dataset,batch_size=BATCH_SIZE,shuffle=False,drop_last=True)
+    test_loader = DataLoader(test_dataset,batch_size=BATCH_SIZE,shuffle=False,drop_last=False)
 
     len_source_loader = len(train_loader_s)
     len_target_loader = len(train_loader_t)
@@ -97,7 +95,6 @@ for iDataSet in range(nDataSet):
             param.requires_grad = False
 
         source_memory = PrototypeMemory(CLASS_NUM, RP_FEATURE_DIM, momentum=0.9).cuda()
-        target_memory = PrototypeMemory(CLASS_NUM, RP_FEATURE_DIM, momentum=0.9).cuda()
 
     print("Training...")
 
@@ -120,9 +117,6 @@ for iDataSet in range(nDataSet):
     loss3 = []
 
     for epoch in range(1, epochs + 1):
-        rp_active = USE_RP and epoch > RP_WARMUP_EPOCHS
-        rp_epoch = max(epoch - RP_WARMUP_EPOCHS, 1)
-        rp_epochs = max(epochs - RP_WARMUP_EPOCHS, 1)
         LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
         print('learning rate{: .4f}'.format(LEARNING_RATE))
         optimizer = torch.optim.SGD([
@@ -170,19 +164,43 @@ for iDataSet in range(nDataSet):
             (_, source3, _, source_outputs3,_,
             _, _, target3, t2, _) =  feature_encoder(source_data1.cuda(),target_data1.cuda())
 
+            softmax_output_t = F.softmax(target_outputs.detach(), dim=1)
+            _, pseudo_label_t_student = torch.max(softmax_output_t, dim=1)
+
             if USE_RP:
+                source_memory.update(source_features.detach(), source_label_cuda)
                 with torch.no_grad():
                     (_, _, _, _, _,
                      _, _, _, teacher_target_outputs, _) = teacher_encoder(source_data_cuda,target_data_cuda)
-                    conf_t, pseudo_label_t, reliable_mask, prob_t = get_reliable_pseudo_labels(
-                        teacher_target_outputs, rp_epoch, rp_epochs,
+                    conf_t, pseudo_label_t_teacher, reliable_mask, prob_t_teacher = get_reliable_pseudo_labels(
+                        teacher_target_outputs, epoch, epochs,
                         threshold_start=RP_THRESHOLD_START,
                         threshold_end=RP_THRESHOLD_END
                     )
+
+                proto_loss_t2s = source_features.new_tensor(0.0)
+                proto_weight = 0.0
+                reliable_num = reliable_mask.sum().item()
+                reliable_ratio = reliable_mask.float().mean().item()
+                conf_mean = conf_t.mean().item()
+                conf_max = conf_t.max().item()
+                pseudo_hist = torch.bincount(
+                    pseudo_label_t_teacher.detach().cpu(), minlength=CLASS_NUM
+                )
+
+                if epoch > RP_WARMUP_EPOCHS and reliable_num >= RP_MIN_RELIABLE_SAMPLES:
+                    proto_loss_t2s = prototype_contrastive_loss(
+                        target_features,
+                        pseudo_label_t_teacher,
+                        source_memory.get(),
+                        temperature=0.1,
+                        mask=reliable_mask
+                    )
+                    progress = (epoch - RP_WARMUP_EPOCHS) / max(1, epochs - RP_WARMUP_EPOCHS)
+                    proto_weight = RP_PROTO_WEIGHT * min(1.0, progress)
             else:
-                softmax_output_t = nn.Softmax(dim=1)(target_outputs).detach()
-                _, pseudo_label_t = torch.max(softmax_output_t, 1)
-                reliable_mask = torch.ones_like(pseudo_label_t, dtype=torch.bool)
+                proto_loss_t2s = source_features.new_tensor(0.0)
+                proto_weight = 0.0
 
             # Supervised Contrastive Loss
             all_source_con_features = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)],dim=1)
@@ -191,63 +209,29 @@ for iDataSet in range(nDataSet):
             # Loss Cls
             cls_loss = crossEntropy(source_outputs, source_label_cuda)
             # Loss Lmmd
-            target_prob = F.softmax(target_outputs, dim=1)
-            if USE_RP and rp_active:
-                t_weight = conf_t * reliable_mask.float()
-                lmmd_loss = mmd.weighted_lmmd(source_features, target_features, source_label,
-                                             prob_t, t_weight=t_weight, BATCH_SIZE=BATCH_SIZE,
-                                             CLASS_NUM=CLASS_NUM)
-            else:
-                lmmd_loss = mmd.lmmd(source_features, target_features, source_label,
-                                     target_prob, BATCH_SIZE=BATCH_SIZE,
-                                     CLASS_NUM=CLASS_NUM)
+            lmmd_loss = mmd.lmmd(source_features, target_features, source_label,
+                                 softmax_output_t, BATCH_SIZE=BATCH_SIZE,
+                                 CLASS_NUM=CLASS_NUM)
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
             # Loss Con_s
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
-            if USE_RP:
-                source_memory.update(source_features.detach(), source_label_cuda)
-                reliable_ratio = reliable_mask.float().mean().item()
-                if rp_active:
-                    contrastive_loss_t = safe_supcon_loss(
-                        ContrastiveLoss_t, all_target_con_features, pseudo_label_t, reliable_mask
-                    )
-                    target_memory.update(target_features.detach(), pseudo_label_t, reliable_mask)
-
-                    proto_loss_s = prototype_contrastive_loss(
-                        source_features, source_label_cuda, source_memory.get(), temperature=0.1
-                    )
-                    proto_loss_t = prototype_contrastive_loss(
-                        target_features, pseudo_label_t, target_memory.get(), temperature=0.1, mask=reliable_mask
-                    )
-                    proto_loss = proto_loss_s + proto_loss_t
-                    consistency_loss = symmetric_consistency_loss(
-                        target_outputs, teacher_target_outputs, mask=reliable_mask
-                    )
-                else:
-                    contrastive_loss_t = source_features.new_tensor(0.0)
-                    proto_loss = source_features.new_tensor(0.0)
-                    consistency_loss = source_features.new_tensor(0.0)
-            else:
-                contrastive_loss_t = ContrastiveLoss_t(all_target_con_features, pseudo_label_t)
-                proto_loss = source_features.new_tensor(0.0)
-                consistency_loss = source_features.new_tensor(0.0)
-                reliable_ratio = 1.0
+            contrastive_loss_t = ContrastiveLoss_t(all_target_con_features, pseudo_label_t_student)
             # Loss Occ
             domain_similar_loss = DSH_loss(source_out, target_out)
 
+            loss_base = (
+                cls_loss
+                + 0.01 * lambd * lmmd_loss
+                + contrastive_loss_s
+                + contrastive_loss_t
+                + domain_similar_loss
+            )
+
             if USE_RP:
-                loss = (
-                    cls_loss
-                    + (RP_LMMD_WEIGHT if rp_active else 0.01) * lambd * lmmd_loss
-                    + contrastive_loss_s
-                    + RP_TARGET_CON_WEIGHT * contrastive_loss_t
-                    + domain_similar_loss
-                    + RP_PROTO_WEIGHT * proto_loss
-                    + RP_CONSISTENCY_WEIGHT * consistency_loss
-                )
+                loss = loss_base + proto_weight * proto_loss_t2s
             else:
-                loss = cls_loss + 0.01 * lambd * lmmd_loss + contrastive_loss_s + contrastive_loss_t + domain_similar_loss
+                loss = loss_base
 
             # Update parameters
             optimizer.zero_grad()
@@ -263,16 +247,16 @@ for iDataSet in range(nDataSet):
             test_accuracy = 100. * float(total_hit) / size
 
         if USE_RP:
-            print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, proto loss:{:6f}, consistency loss:{:6f}, reliable ratio:{:6.4f},acc {:6.4f}, total loss: {:6.4f}'
+            print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, proto_t2s loss:{:6f}, proto weight:{:6.4f}, reliable ratio:{:6.4f}, reliable num:{:>2d}, conf mean:{:6.4f}, conf max:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, pseudo hist:{}'
                   .format(epoch , cls_loss.item(),lmmd_loss.item(),contrastive_loss_s.item(),contrastive_loss_t.item(),
-                   proto_loss.item(),consistency_loss.item(),reliable_ratio,total_hit / size,loss.item()))
+                   proto_loss_t2s.item(),proto_weight,reliable_ratio,int(reliable_num),conf_mean,conf_max,total_hit / size,loss.item(),pseudo_hist.tolist()))
         else:
             print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f},acc {:6.4f}, total loss: {:6.4f}'
                   .format(epoch , cls_loss.item(),lmmd_loss.item(),contrastive_loss_s.item(),contrastive_loss_t.item(),
                    total_hit / size,loss.item()))
 
         train_end = time.time()
-        if epoch % epochs == 0:
+        if epoch % RP_EVAL_INTERVAL == 0 or epoch == epochs:
             # print("Testing ...")
             feature_encoder.eval()
             total_rewards = 0
