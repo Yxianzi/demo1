@@ -267,9 +267,10 @@ for iDataSet in range(nDataSet):
             with torch.no_grad():
                 for test_datas, test_labels in test_loader:
                     batch_size = test_labels.shape[0]
+                    eval_source_data = source_data[:batch_size]
 
                     source_features, source1, _, source_outputs, source_out, test_features, _, _, test_outputs, _ = feature_encoder(
-                            Variable(source_data).cuda(), Variable(test_datas).cuda())
+                            Variable(eval_source_data).cuda(), Variable(test_datas).cuda())
 
                     pred = test_outputs.data.max(1)[1]
 
