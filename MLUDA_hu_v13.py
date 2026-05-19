@@ -21,7 +21,7 @@ from contrastive_loss import SupConLoss
 from config_Houston import *
 from sklearn import svm
 from UtilsCMS import *
-from rp_utils import update_ema_teacher, get_reliable_pseudo_labels
+from rp_utils import update_ema_teacher, get_reliable_pseudo_labels, dynamic_threshold
 from prototype_memory import (
     PrototypeMemory,
     compute_prototype_prediction,
@@ -31,6 +31,7 @@ from prototype_memory import (
 
 USE_RP = True
 USE_CBPC_V13 = True
+USE_MVPCS_V14 = True
 
 RP_FEATURE_DIM = 288
 RP_WARMUP_EPOCHS = 30
@@ -40,6 +41,11 @@ RP_PROTO_WEIGHT = 0.01
 RP_MIN_RELIABLE_SAMPLES = 4
 RP_CLASS_TOPK = 2
 RP_EVAL_INTERVAL = 10
+RP_MV_CONSIST_MIN_VOTES = 2
+RP_PROTO_MARGIN_THRESHOLD = 0.08
+RP_AGREE_WEIGHT = 1.0
+RP_DISAGREE_WEIGHT = 0.5
+RP_PROTO_ONLY_WEIGHT = 0.3
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
@@ -204,7 +210,11 @@ for iDataSet in range(nDataSet):
             proto_loss_t2s = source_features.new_tensor(0.0)
             proto_weight = 0.0
             reliable_ratio = 0.0
-            agreement_num = 0
+            certain_num = 0
+            agree_certain_num = 0
+            disagree_certain_num = 0
+            proto_only_num = 0
+            candidate_num = 0
             selected_num = 0
 
             if USE_RP:
@@ -215,31 +225,84 @@ for iDataSet in range(nDataSet):
 
                 with torch.no_grad():
                     (_, _, _, _, _,
-                     _, _, _, teacher_target_outputs, _) = teacher_encoder(
+                     _, _, _, t_logits0, _) = teacher_encoder(
                         source_data_cuda,
                         target_data_cuda
                     )
+                    (_, _, _, _, _,
+                     _, _, _, t_logits1, _) = teacher_encoder(
+                        source_data_cuda,
+                        target_data0.cuda()
+                    )
+                    (_, _, _, _, _,
+                     _, _, _, t_logits2, _) = teacher_encoder(
+                        source_data_cuda,
+                        target_data1.cuda()
+                    )
 
-                    conf_t, pseudo_label_t_teacher, reliable_mask, prob_t_teacher = get_reliable_pseudo_labels(
-                        teacher_target_outputs,
+                    prob0 = F.softmax(t_logits0, dim=1)
+                    prob1 = F.softmax(t_logits1, dim=1)
+                    prob2 = F.softmax(t_logits2, dim=1)
+
+                    prob_mean = (prob0 + prob1 + prob2) / 3.0
+                    conf_t, pseudo_label_t_teacher = prob_mean.max(dim=1)
+
+                    label0 = prob0.argmax(dim=1)
+                    label1 = prob1.argmax(dim=1)
+                    label2 = prob2.argmax(dim=1)
+
+                    labels_stack = torch.stack([label0, label1, label2], dim=1)
+                    vote_count = torch.zeros_like(pseudo_label_t_teacher)
+                    for cls_id in range(CLASS_NUM):
+                        cls_votes = (labels_stack == cls_id).sum(dim=1)
+                        vote_count = torch.maximum(vote_count, cls_votes)
+
+                    mv_consistent_mask = vote_count >= RP_MV_CONSIST_MIN_VOTES
+
+                    threshold = dynamic_threshold(
                         epoch,
                         epochs,
-                        threshold_start=RP_THRESHOLD_START,
-                        threshold_end=RP_THRESHOLD_END
+                        start=RP_THRESHOLD_START,
+                        end=RP_THRESHOLD_END
                     )
+
+                    reliable_mask = conf_t >= threshold
 
                     proto_logits_t, proto_pred_t = compute_prototype_prediction(
                         target_features.detach(),
                         source_memory.get()
                     )
 
-                    agreement_mask = proto_pred_t == pseudo_label_t_teacher
-                    candidate_mask = reliable_mask & agreement_mask
+                    proto_top2 = torch.topk(proto_logits_t, k=2, dim=1).values
+                    proto_conf_t = proto_top2[:, 0]
+                    proto_margin_t = proto_top2[:, 0] - proto_top2[:, 1]
+
+                    proto_agree_mask = proto_pred_t == pseudo_label_t_teacher
+
+                    certain_mask = reliable_mask & mv_consistent_mask
+
+                    candidate_label = pseudo_label_t_teacher.clone()
+                    sample_weight = torch.zeros_like(conf_t)
+
+                    agree_certain_mask = certain_mask & proto_agree_mask
+                    disagree_certain_mask = certain_mask & (~proto_agree_mask)
+
+                    sample_weight[agree_certain_mask] = RP_AGREE_WEIGHT * conf_t[agree_certain_mask]
+                    sample_weight[disagree_certain_mask] = RP_DISAGREE_WEIGHT * conf_t[disagree_certain_mask]
+
+                    proto_only_mask = (
+                        (~certain_mask)
+                        & (proto_margin_t >= RP_PROTO_MARGIN_THRESHOLD)
+                    )
+                    candidate_label[proto_only_mask] = proto_pred_t[proto_only_mask]
+                    sample_weight[proto_only_mask] = RP_PROTO_ONLY_WEIGHT * proto_margin_t[proto_only_mask].clamp(min=0.0)
+
+                    candidate_mask = sample_weight > 0
 
                     if USE_CBPC_V13:
                         selected_mask = class_balanced_topk_mask(
-                            labels=pseudo_label_t_teacher,
-                            scores=conf_t,
+                            labels=candidate_label,
+                            scores=sample_weight,
                             candidate_mask=candidate_mask,
                             num_classes=CLASS_NUM,
                             top_k=RP_CLASS_TOPK
@@ -248,26 +311,34 @@ for iDataSet in range(nDataSet):
                         selected_mask = candidate_mask
 
                     reliable_ratio = reliable_mask.float().mean().item()
-                    agreement_num = int(agreement_mask.sum().item())
+                    certain_num = int(certain_mask.sum().item())
+                    agree_certain_num = int(agree_certain_mask.sum().item())
+                    disagree_certain_num = int(disagree_certain_mask.sum().item())
+                    proto_only_num = int(proto_only_mask.sum().item())
+                    candidate_num = int(candidate_mask.sum().item())
                     selected_num = int(selected_mask.sum().item())
                     conf_mean = conf_t.mean().item()
                     conf_max = conf_t.max().item()
+                    proto_conf_mean = proto_conf_t.mean().item()
+                    proto_conf_max = proto_conf_t.max().item()
+                    proto_margin_mean = proto_margin_t.mean().item()
+                    proto_margin_max = proto_margin_t.max().item()
                     pseudo_hist = torch.bincount(
                         pseudo_label_t_teacher.detach().cpu(), minlength=CLASS_NUM
                     )
-                    agreement_hist = torch.bincount(
-                        pseudo_label_t_teacher[agreement_mask].detach().cpu(), minlength=CLASS_NUM
+                    candidate_hist = torch.bincount(
+                        candidate_label[candidate_mask].detach().cpu(), minlength=CLASS_NUM
                     )
                     selected_hist = torch.bincount(
-                        pseudo_label_t_teacher[selected_mask].detach().cpu(), minlength=CLASS_NUM
+                        candidate_label[selected_mask].detach().cpu(), minlength=CLASS_NUM
                     )
 
                 if epoch > RP_WARMUP_EPOCHS and selected_num >= RP_MIN_RELIABLE_SAMPLES:
                     proto_loss_t2s = confidence_weighted_prototype_loss(
                         features=target_features,
-                        labels=pseudo_label_t_teacher,
+                        labels=candidate_label,
                         prototypes=source_memory.get(),
-                        confidence=conf_t,
+                        confidence=sample_weight,
                         temperature=0.1,
                         mask=selected_mask
                     )
@@ -293,9 +364,9 @@ for iDataSet in range(nDataSet):
             test_accuracy = 100. * float(total_hit) / size
 
         if USE_RP:
-            print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, proto_t2s loss:{:6f}, proto weight:{:6.4f}, reliable ratio:{:6.4f}, agreement num:{:>2d}, selected num:{:>2d}, conf mean:{:6.4f}, conf max:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, pseudo hist:{}, agreement hist:{}, selected hist:{}'
+            print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, proto_t2s loss:{:6f}, proto weight:{:6.4f}, reliable ratio:{:6.4f}, certain num:{:>2d}, agree certain:{:>2d}, disagree certain:{:>2d}, proto only:{:>2d}, candidate num:{:>2d}, selected num:{:>2d}, conf mean:{:6.4f}, conf max:{:6.4f}, proto conf mean:{:6.4f}, proto conf max:{:6.4f}, proto margin mean:{:6.4f}, proto margin max:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, pseudo hist:{}, candidate hist:{}, selected hist:{}'
                   .format(epoch , cls_loss.item(),lmmd_loss.item(),contrastive_loss_s.item(),contrastive_loss_t.item(),
-                   proto_loss_t2s.item(),proto_weight,reliable_ratio,agreement_num,selected_num,conf_mean,conf_max,total_hit / size,loss.item(),pseudo_hist.tolist(),agreement_hist.tolist(),selected_hist.tolist()))
+                   proto_loss_t2s.item(),proto_weight,reliable_ratio,certain_num,agree_certain_num,disagree_certain_num,proto_only_num,candidate_num,selected_num,conf_mean,conf_max,proto_conf_mean,proto_conf_max,proto_margin_mean,proto_margin_max,total_hit / size,loss.item(),pseudo_hist.tolist(),candidate_hist.tolist(),selected_hist.tolist()))
         else:
             print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f},acc {:6.4f}, total loss: {:6.4f}'
                   .format(epoch , cls_loss.item(),lmmd_loss.item(),contrastive_loss_s.item(),contrastive_loss_t.item(),
