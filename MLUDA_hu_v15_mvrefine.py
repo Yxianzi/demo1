@@ -277,6 +277,13 @@ for iDataSet in range(nDataSet):
                 "student_hist": student_hist,
                 "conf_mean": 0.0,
                 "conf_max": 0.0,
+                "guard_reject": False,
+                "student_nonzero": int((student_hist > 0).sum().item()),
+                "refined_nonzero": int((student_hist > 0).sum().item()),
+                "student_top_ratio": float((student_hist.max().float() / student_hist.sum().float().clamp_min(1.0)).item()),
+                "refined_top_ratio": float((student_hist.max().float() / student_hist.sum().float().clamp_min(1.0)).item()),
+                "accepted_num": 0,
+                "class_cap": 0,
             }
 
             if USE_MVREFINE_V15 and USE_EMA_TEACHER and epoch > MV_WARMUP_EPOCHS:
@@ -352,11 +359,14 @@ for iDataSet in range(nDataSet):
 
             test_accuracy = 100. * float(total_hit) / size
 
-        print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, rho:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student hist:{}, refined hist:{}'
+        print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, rho:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted num:{:>2d}, class cap:{:>2d}, student nz:{:>2d}, refined nz:{:>2d}, student top:{:6.4f}, refined top:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student hist:{}, refined hist:{}'
               .format(epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
                contrastive_loss_t.item(), domain_similar_loss.item(), rho, mv_stats['threshold'],
                mv_stats['pair_threshold'], mv_stats['triple_num'], mv_stats['pair_num'],
-               mv_stats['reliable_num'], mv_stats['reliable_ratio'], total_hit / size,
+               mv_stats['reliable_num'], mv_stats['reliable_ratio'], mv_stats['guard_reject'],
+               mv_stats['accepted_num'], mv_stats['class_cap'], mv_stats['student_nonzero'],
+               mv_stats['refined_nonzero'], mv_stats['student_top_ratio'], mv_stats['refined_top_ratio'],
+               total_hit / size,
                loss.item(), mv_stats['student_hist'].tolist(), mv_stats['refined_hist'].tolist()))
 
         train_end = time.time()
