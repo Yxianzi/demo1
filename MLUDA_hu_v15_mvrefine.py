@@ -17,7 +17,7 @@ from net2 import DSANSS
 import time
 import utils
 from torch.utils.data import TensorDataset, DataLoader
-from contrastive_loss import SupConLoss
+from contrastive_loss import SupConLoss, SafeWeightedSupConLoss
 from config_Houston import *
 from sklearn import svm
 from UtilsCMS import *
@@ -26,6 +26,8 @@ from mv_refine import multiview_refine_pseudo_labels
 
 USE_MVREFINE_V15 = True
 USE_EMA_TEACHER = True
+USE_CB_RPLS = True
+USE_EW_TMCC = True
 
 MV_WARMUP_EPOCHS = 20
 MV_THRESHOLD_START = 0.80
@@ -35,9 +37,40 @@ MV_PAIR_WEIGHT = 0.7
 MV_LMMD_BLEND_MAX = 0.3
 RP_EVAL_INTERVAL = 10
 
+RPLS_WARMUP_EPOCHS = MV_WARMUP_EPOCHS
+RPLS_LMMD_BLEND_MAX = 0.5
+
+LAMBDA_TGT_CON = 1.0
+LAMBDA_TMCC = 0.05
+TMCC_TEMPERATURE = 2.5
+TMCC_WARMUP_EPOCHS = 20
+
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
     return torch.frombuffer(array, dtype=torch_dtype).reshape(array.shape)
+
+def entropy_weighted_mcc_loss(logits, temperature=2.5, sample_weight=None, eps=1e-6):
+    prob = F.softmax(logits / temperature, dim=1)
+    entropy = -torch.sum(prob * torch.log(prob.clamp_min(eps)), dim=1)
+    entropy_weight = 1.0 + torch.exp(-entropy)
+    entropy_weight = entropy_weight / entropy_weight.sum().clamp_min(eps) * prob.size(0)
+
+    if sample_weight is not None:
+        entropy_weight = entropy_weight * sample_weight.detach().to(
+            device=logits.device,
+            dtype=logits.dtype
+        ).view(-1)
+        if entropy_weight.sum().item() <= eps:
+            return logits.new_tensor(0.0)
+        entropy_weight = entropy_weight / entropy_weight.sum().clamp_min(eps) * prob.size(0)
+
+    weighted_prob = prob * entropy_weight.view(-1, 1)
+    class_confusion = torch.mm(weighted_prob.t(), prob)
+    class_confusion = class_confusion / class_confusion.sum(dim=1, keepdim=True).clamp_min(eps)
+
+    num_classes = prob.size(1)
+    off_diag = class_confusion.sum() - torch.trace(class_confusion)
+    return off_diag / num_classes
 
 def evaluate_target_domain(model, test_loader, source_reference_data):
     model.eval()
@@ -140,7 +173,7 @@ data_s,data_t = ILDA(data_s,data_t,pca_n,radius)
 # Loss Function
 crossEntropy = nn.CrossEntropyLoss().cuda()
 ContrastiveLoss_s = SupConLoss(temperature=0.1).cuda()
-ContrastiveLoss_t = SupConLoss(temperature=0.1).cuda()
+ContrastiveLoss_t = SafeWeightedSupConLoss(temperature=0.1).cuda()
 DSH_loss = utils.Domain_Occ_loss().cuda()
 
 student_acc = np.zeros([nDataSet, 1])
@@ -229,7 +262,7 @@ for iDataSet in range(nDataSet):
 
         for i in range(1,num_iter):
             source_data, source_label = next(iter_source)
-            target_data, target_label = next(iter_target)
+            target_data, _target_label = next(iter_target)
 
             if i % len_target_loader == 0:
                 iter_target = iter(train_loader_t)
@@ -259,9 +292,12 @@ for iDataSet in range(nDataSet):
             student_prob_t = F.softmax(target_outputs.detach(), dim=1)
             _, pseudo_label_t_student = torch.max(student_prob_t, dim=1)
 
-            target_prob_for_lmmd = student_prob_t
+            refined_label = pseudo_label_t_student
+            refined_prob = student_prob_t
+            reliable_mask = torch.zeros_like(pseudo_label_t_student, dtype=torch.bool)
+            sample_weight = target_outputs.new_zeros(target_outputs.size(0))
             pseudo_label_t_for_scl = pseudo_label_t_student
-            rho = 0.0
+            lmmd_rho = 0.0
             student_hist = torch.bincount(
                 pseudo_label_t_student.detach().cpu(), minlength=CLASS_NUM
             )
@@ -307,17 +343,6 @@ for iDataSet in range(nDataSet):
 
                     pseudo_label_t_for_scl = refined_label
 
-                    mv_progress = min(
-                        1.0,
-                        max(0.0, (epoch - MV_WARMUP_EPOCHS) / max(1, epochs - MV_WARMUP_EPOCHS))
-                    )
-                    rho = MV_LMMD_BLEND_MAX * mv_progress
-
-                    target_prob_for_lmmd = (
-                        (1.0 - rho) * student_prob_t
-                        + rho * refined_prob.detach()
-                    )
-
             # Supervised Contrastive Loss
             all_source_con_features = torch.cat([source2.unsqueeze(1), source3.unsqueeze(1)],dim=1)
             all_target_con_features = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)
@@ -325,23 +350,91 @@ for iDataSet in range(nDataSet):
             # Loss Cls
             cls_loss = crossEntropy(source_outputs, source_label_cuda)
             # Loss Lmmd
-            lmmd_loss = mmd.lmmd(source_features, target_features, source_label,
-                                 target_prob_for_lmmd.detach(), BATCH_SIZE=BATCH_SIZE,
-                                 CLASS_NUM=CLASS_NUM)
+            lmmd_loss_base = mmd.lmmd(
+                source_features,
+                target_features,
+                source_label,
+                student_prob_t.detach(),
+                BATCH_SIZE=BATCH_SIZE,
+                CLASS_NUM=CLASS_NUM
+            )
+            if (
+                USE_CB_RPLS
+                and epoch > RPLS_WARMUP_EPOCHS
+                and reliable_mask.sum().item() > 0
+                and sample_weight.detach().sum().item() > 0
+            ):
+                lmmd_loss_reliable = mmd.weighted_lmmd(
+                    source_features,
+                    target_features,
+                    source_label,
+                    refined_prob.detach(),
+                    t_weight=sample_weight.detach(),
+                    BATCH_SIZE=BATCH_SIZE,
+                    CLASS_NUM=CLASS_NUM
+                )
+                if not torch.isfinite(lmmd_loss_reliable).item():
+                    lmmd_loss_reliable = target_features.new_tensor(0.0)
+
+                rpls_progress = min(
+                    1.0,
+                    max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, epochs - RPLS_WARMUP_EPOCHS))
+                )
+                lmmd_rho = RPLS_LMMD_BLEND_MAX * rpls_progress
+                lmmd_loss = (1.0 - lmmd_rho) * lmmd_loss_base + lmmd_rho * lmmd_loss_reliable
+            else:
+                lmmd_loss = lmmd_loss_base
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
             # Loss Con_s
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
-            contrastive_loss_t = ContrastiveLoss_t(all_target_con_features, pseudo_label_t_for_scl)
+            if USE_CB_RPLS:
+                target_con_num = int(reliable_mask.sum().item()) if epoch > RPLS_WARMUP_EPOCHS else 0
+                if epoch > RPLS_WARMUP_EPOCHS and reliable_mask.sum().item() >= 2:
+                    contrastive_loss_t = ContrastiveLoss_t(
+                        all_target_con_features[reliable_mask],
+                        pseudo_label_t_for_scl[reliable_mask],
+                        sample_weight=sample_weight[reliable_mask]
+                    )
+                else:
+                    contrastive_loss_t = target_features.new_tensor(0.0)
+            else:
+                target_con_num = int(pseudo_label_t_for_scl.numel())
+                contrastive_loss_t = ContrastiveLoss_t(
+                    all_target_con_features,
+                    pseudo_label_t_for_scl
+                )
             # Loss Occ
             domain_similar_loss = DSH_loss(source_out, target_out)
+
+            if USE_EW_TMCC and epoch > TMCC_WARMUP_EPOCHS:
+                if USE_CB_RPLS and reliable_mask.sum().item() > 0:
+                    tmcc_loss = entropy_weighted_mcc_loss(
+                        target_outputs,
+                        temperature=TMCC_TEMPERATURE,
+                        sample_weight=sample_weight
+                    )
+                else:
+                    tmcc_loss = entropy_weighted_mcc_loss(
+                        target_outputs,
+                        temperature=TMCC_TEMPERATURE,
+                        sample_weight=None
+                    )
+            else:
+                tmcc_loss = target_features.new_tensor(0.0)
+
+            if reliable_mask.sum().item() > 0:
+                weight_mean = float(sample_weight[reliable_mask].mean().item())
+            else:
+                weight_mean = 0.0
 
             loss_base = (
                 cls_loss
                 + 0.01 * lambd * lmmd_loss
                 + contrastive_loss_s
-                + contrastive_loss_t
+                + LAMBDA_TGT_CON * contrastive_loss_t
                 + domain_similar_loss
+                + LAMBDA_TMCC * lambd * tmcc_loss
             )
 
             loss = loss_base
@@ -359,10 +452,11 @@ for iDataSet in range(nDataSet):
 
             test_accuracy = 100. * float(total_hit) / size
 
-        print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, rho:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted num:{:>2d}, class cap:{:>2d}, student nz:{:>2d}, refined nz:{:>2d}, student top:{:6.4f}, refined top:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student hist:{}, refined hist:{}'
+        print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, tmcc loss:{:6f}, lmmd rho:{:6.4f}, target con num:{:>2d}, reliable weight mean:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted num:{:>2d}, class cap:{:>2d}, student nz:{:>2d}, refined nz:{:>2d}, student top:{:6.4f}, refined top:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student hist:{}, refined hist:{}'
               .format(epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
-               contrastive_loss_t.item(), domain_similar_loss.item(), rho, mv_stats['threshold'],
-               mv_stats['pair_threshold'], mv_stats['triple_num'], mv_stats['pair_num'],
+               contrastive_loss_t.item(), domain_similar_loss.item(), tmcc_loss.item(), lmmd_rho,
+               target_con_num, weight_mean, mv_stats['threshold'], mv_stats['pair_threshold'],
+               mv_stats['triple_num'], mv_stats['pair_num'],
                mv_stats['reliable_num'], mv_stats['reliable_ratio'], mv_stats['guard_reject'],
                mv_stats['accepted_num'], mv_stats['class_cap'], mv_stats['student_nonzero'],
                mv_stats['refined_nonzero'], mv_stats['student_top_ratio'], mv_stats['refined_top_ratio'],

@@ -113,3 +113,88 @@ class SupConLoss(nn.Module):
         loss = loss.view(anchor_count, batch_size).mean()
 
         return loss
+
+
+class SafeWeightedSupConLoss(nn.Module):
+    """Numerically safe supervised contrastive loss with optional anchor weights."""
+
+    def __init__(self, temperature=0.07, contrast_mode='all', base_temperature=0.07, eps=1e-8):
+        super(SafeWeightedSupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = temperature
+        self.eps = eps
+
+    def forward(self, features, labels, sample_weight=None):
+        """Compute target SupCon loss while skipping anchors without positives."""
+
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...], at least 3 dimensions are required')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        device = features.device
+        batch_size = features.shape[0]
+        if batch_size < 2:
+            return features.new_tensor(0.0)
+
+        labels = labels.contiguous().view(-1, 1).to(device=device)
+        if labels.shape[0] != batch_size:
+            raise ValueError('Num of labels does not match num of features')
+
+        if sample_weight is not None:
+            sample_weight = sample_weight.to(device=device, dtype=features.dtype).view(-1)
+            if sample_weight.shape[0] != batch_size:
+                raise ValueError('Num of sample weights does not match num of features')
+
+        mask = torch.eq(labels, labels.T).to(device=device, dtype=features.dtype)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature
+        )
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        mask = mask.repeat(anchor_count, contrast_count)
+        logits_mask = torch.ones_like(mask)
+        logits_mask = torch.scatter(
+            logits_mask,
+            1,
+            torch.arange(batch_size * anchor_count, device=device).view(-1, 1),
+            0
+        )
+        mask = mask * logits_mask
+
+        pos_count = mask.sum(1)
+        valid_anchor = pos_count > 0
+        if not torch.any(valid_anchor):
+            return features.new_tensor(0.0)
+
+        exp_logits = torch.exp(logits) * logits_mask
+        log_den = exp_logits.sum(1, keepdim=True).clamp_min(self.eps).log()
+        log_prob = logits - log_den
+
+        mean_log_prob_pos = (mask * log_prob).sum(1) / pos_count.clamp_min(self.eps)
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss[valid_anchor]
+
+        if sample_weight is not None:
+            anchor_weight = sample_weight.repeat(anchor_count)[valid_anchor]
+            weight_sum = anchor_weight.sum()
+            if weight_sum.item() <= self.eps:
+                return features.new_tensor(0.0)
+            return (loss * anchor_weight).sum() / weight_sum.clamp_min(self.eps)
+
+        return loss.mean()
