@@ -110,7 +110,8 @@ def minimum_class_confusion_loss(logits, temperature=2.5):
 def target_diversity_loss(target_logits):
     probs = F.softmax(target_logits, dim=1)
     mean_probs = probs.mean(dim=0)
-    return torch.sum(mean_probs * torch.log(mean_probs.clamp_min(1e-8)))
+    uniform = torch.full_like(mean_probs, 1.0 / mean_probs.numel())
+    return F.kl_div(mean_probs.clamp_min(1e-8).log(), uniform, reduction="sum")
 
 
 def build_patch_reliability_map(target_x, reliability, sigma=1.0):
@@ -238,12 +239,25 @@ def update_reliability_weighted_memory(
 
 
 @torch.no_grad()
-def get_fused_memory_prototypes(source_memory, target_memory, target_counts=None, proto_count_tau=20):
+def get_fused_memory_prototypes(
+    source_memory,
+    target_memory,
+    target_counts=None,
+    proto_count_tau=20,
+    use_target=True,
+):
     """Build fused prototypes from EMA source/target memories for train/eval."""
 
     source_proto = source_memory.get()
-    target_proto = target_memory.get().to(device=source_proto.device, dtype=source_proto.dtype)
     source_valid = source_memory.initialized
+    if not use_target or target_memory is None:
+        if not source_valid.any():
+            return None
+        fused = source_proto.clone()
+        fused[~source_valid] = 0.0
+        return F.normalize(fused, p=2, dim=1, eps=1e-8)
+
+    target_proto = target_memory.get().to(device=source_proto.device, dtype=source_proto.dtype)
     target_valid = target_memory.initialized.to(source_valid.device)
     valid = source_valid | target_valid
     if not valid.any():
@@ -433,6 +447,9 @@ def main():
     eval_interval = int(cfg.get("eval_interval", 10))
     n_datasets = min(int(cfg.get("n_datasets", 3)), len(seeds))
     use_reliability_eval = bool(cfg.get("use_reliability_eval", True)) and not args.disable_reliability_eval
+    pseudo_warmup_epochs = int(cfg.get("pseudo_warmup_epochs", 15))
+    target_proto_warmup_epochs = int(cfg.get("target_proto_warmup_epochs", 20))
+    proto_head_warmup_epochs = int(cfg.get("proto_head_warmup_epochs", 10))
 
     data_s, label_s = utils.load_data_houston(cfg["source_data"], cfg["source_label"])
     data_t, label_t = utils.load_data_houston(cfg["target_data"], cfg["target_label"])
@@ -530,6 +547,10 @@ def main():
             for param_group in optimizer.param_groups:
                 param_group["lr"] = learning_rate
 
+            pseudo_active = epoch > pseudo_warmup_epochs
+            target_proto_active = epoch > target_proto_warmup_epochs
+            proto_head_active = (epoch > proto_head_warmup_epochs) and not args.disable_proto_head
+
             model.train()
             teacher_model.eval()
             source_iter = iter(source_loader)
@@ -576,7 +597,7 @@ def main():
                 source_y_cuda = source_y.to(device)
                 target_x = target_x.to(device)
                 target_coords_batch = target_coords_batch.to(device)
-                if args.disable_proto_head:
+                if not proto_head_active:
                     prototypes_for_head = None
                 else:
                     prototypes_for_head = get_fused_memory_prototypes(
@@ -584,6 +605,7 @@ def main():
                         target_proto_memory,
                         target_counts=target_proto_counts,
                         proto_count_tau=float(cfg.get("proto_count_tau", 20)),
+                        use_target=target_proto_active,
                     )
 
                 source_out = model(
@@ -665,13 +687,17 @@ def main():
                         alpha=float(cfg["spatial_vote_alpha"]),
                     )
                     pseudo_labels = refined_probs.argmax(dim=1)
-                    selected_mask, batch_selected_per_class = class_balanced_reliable_selection(
-                        pseudo_labels,
-                        reliability.detach(),
-                        min_threshold=threshold,
-                        topk_per_class=int(cfg["topk_per_class"]),
-                        num_classes=num_classes,
-                    )
+                    if pseudo_active:
+                        selected_mask, batch_selected_per_class = class_balanced_reliable_selection(
+                            pseudo_labels,
+                            reliability.detach(),
+                            min_threshold=threshold,
+                            topk_per_class=int(cfg["topk_per_class"]),
+                            num_classes=num_classes,
+                        )
+                    else:
+                        selected_mask = torch.zeros_like(pseudo_labels, dtype=torch.bool)
+                        batch_selected_per_class = torch.zeros(num_classes, device=device, dtype=torch.long)
 
                 source_ce = cross_entropy(source_logits, source_y_cuda)
                 lmmd_loss = compute_lmmd_loss(
@@ -719,12 +745,15 @@ def main():
                     spatial_pred_loss = target_logits.new_tensor(0.0)
                     spatial_feat_loss = target_logits.new_tensor(0.0)
 
-                teacher_consistency_loss = weighted_kl_loss(
-                    target_logits,
-                    refined_probs.detach(),
-                    weight=reliability.detach(),
-                    mask=selected_mask if selected_mask.any() else None,
-                )
+                if pseudo_active and selected_mask.any():
+                    teacher_consistency_loss = weighted_kl_loss(
+                        target_logits,
+                        refined_probs.detach(),
+                        weight=reliability.detach(),
+                        mask=selected_mask,
+                    )
+                else:
+                    teacher_consistency_loss = target_logits.new_tensor(0.0)
 
                 loss_warm = (
                     source_ce
@@ -738,7 +767,7 @@ def main():
                     + float(cfg["lambda_sp_feat"]) * spatial_feat_loss
                     + float(cfg["lambda_cons"]) * teacher_consistency_loss
                 )
-                total_loss = loss_warm + ramp * loss_extra + float(cfg.get("lambda_div", 0.05)) * diversity_loss
+                total_loss = loss_warm + ramp * loss_extra + float(cfg.get("lambda_div", 0.01)) * diversity_loss
 
                 optimizer.zero_grad()
                 total_loss.backward()
@@ -750,7 +779,7 @@ def main():
                         source_features.detach(),
                         source_y_cuda.detach(),
                     )
-                    if selected_mask.any():
+                    if target_proto_active and selected_mask.any():
                         selected_detached = selected_mask.detach()
                         epoch_target_features.append(target_features.detach()[selected_detached])
                         epoch_target_labels.append(pseudo_labels.detach()[selected_detached])
@@ -795,7 +824,8 @@ def main():
             target_proto_initialized = target_proto_memory.initialized.detach().cpu().tolist()
             denom = max(1, num_batches)
             print(
-                "epoch {:>3d}: lr:{:.5f}, source_ce:{:6.4f}, lmmd_loss:{:6.4f}, "
+                "epoch {:>3d}: lr:{:.5f}, pseudo_active:{}, target_proto_active:{}, "
+                "proto_head_active:{}, source_ce:{:6.4f}, lmmd_loss:{:6.4f}, "
                 "mcc_loss:{:6.4f}, pseudo_ce_loss:{:6.4f}, proto_align_loss:{:6.4f}, "
                 "spatial_pred_loss:{:6.4f}, spatial_feat_loss:{:6.4f}, "
                 "teacher_consistency_loss:{:6.4f}, diversity_loss:{:6.4f}, "
@@ -805,6 +835,9 @@ def main():
                 "target_proto_initialized:{}, threshold:{:6.4f}, ramp:{:6.4f}, total_loss:{:6.4f}".format(
                     epoch,
                     learning_rate,
+                    pseudo_active,
+                    target_proto_active,
+                    proto_head_active,
                     meter["source_ce"] / denom,
                     meter["lmmd"] / denom,
                     meter["mcc"] / denom,
@@ -831,12 +864,13 @@ def main():
                 test_begin = time.time()
                 print("Testing epoch {} ...".format(epoch))
                 eval_prototypes = None
-                if not args.disable_proto_head:
+                if proto_head_active:
                     eval_prototypes = get_fused_memory_prototypes(
                         source_proto_memory,
                         target_proto_memory,
                         target_counts=target_proto_counts,
                         proto_count_tau=float(cfg.get("proto_count_tau", 20)),
+                        use_target=target_proto_active,
                     )
                 last_result = evaluate_target_domain(
                     model,
@@ -858,6 +892,8 @@ def main():
 
         train_time += time.time() - train_start
         if last_result is None:
+            final_target_proto_active = epochs > target_proto_warmup_epochs
+            final_proto_head_active = (epochs > proto_head_warmup_epochs) and not args.disable_proto_head
             last_result = evaluate_target_domain(
                 model,
                 target_test_loader,
@@ -865,12 +901,13 @@ def main():
                 num_classes,
                 prototypes=(
                     None
-                    if args.disable_proto_head
+                    if not final_proto_head_active
                     else get_fused_memory_prototypes(
                         source_proto_memory,
                         target_proto_memory,
                         target_counts=target_proto_counts,
                         proto_count_tau=float(cfg.get("proto_count_tau", 20)),
+                        use_target=final_target_proto_active,
                     )
                 ),
                 use_reliability_eval=use_reliability_eval,

@@ -19,6 +19,9 @@ warmup_epochs: 10
 eval_interval: 10
 n_datasets: 3
 use_reliability_eval: true
+pseudo_warmup_epochs: 15
+target_proto_warmup_epochs: 20
+proto_head_warmup_epochs: 10
 
 num_tokens: 8
 token_dim: 128
@@ -37,11 +40,11 @@ lambda_proto: 0.05
 lambda_sp_pred: 0.05
 lambda_sp_feat: 0.01
 lambda_cons: 0.02
-lambda_div: 0.05
+lambda_div: 0.01
 
-pseudo_threshold_start: 0.45
-pseudo_threshold_end: 0.50
-topk_per_class: 8
+pseudo_threshold_start: 0.60
+pseudo_threshold_end: 0.70
+topk_per_class: 4
 
 spatial_k: 6
 sigma_spatial: 2.5
