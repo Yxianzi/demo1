@@ -292,7 +292,18 @@ def compute_lmmd_loss(source_features, target_features, source_labels, target_pr
     )
 
 
-def evaluate_target_domain(model, test_loader, device, num_classes, prototypes=None):
+def evaluate_target_domain(
+    model,
+    test_loader,
+    device,
+    num_classes,
+    prototypes=None,
+    use_reliability_eval=True,
+    spatial_k=6,
+    sigma_spatial=2.5,
+    sigma_spectral=1.0,
+    reliability_map_sigma=1.0,
+):
     model.eval()
     predict = np.array([], dtype=np.int64)
     labels = np.array([], dtype=np.int64)
@@ -300,12 +311,39 @@ def evaluate_target_domain(model, test_loader, device, num_classes, prototypes=N
 
     with torch.no_grad():
         for batch in test_loader:
+            coords = None
             if len(batch) == 3:
-                data, label, _coords = batch
+                data, label, coords = batch
             else:
                 data, label = batch
             data = data.to(device)
-            out = model(data, reliability=None, domain="target", prototypes=prototypes)
+            if use_reliability_eval and coords is not None:
+                coords = coords.to(device)
+                pre_out = model(data, reliability=None, domain="target", prototypes=prototypes)
+                probs = F.softmax(pre_out["logits"], dim=1)
+                reliability, _affinity, _spatial_stats = compute_spatial_reliability(
+                    probs.detach(),
+                    coords,
+                    data,
+                    k=int(spatial_k),
+                    sigma_spatial=float(sigma_spatial),
+                    sigma_spectral=float(sigma_spectral),
+                )
+                reliability = reliability.detach()
+                reliability_map = build_patch_reliability_map(
+                    data,
+                    reliability,
+                    sigma=float(reliability_map_sigma),
+                )
+                out = model(
+                    data,
+                    reliability=reliability,
+                    reliability_map=reliability_map,
+                    domain="target",
+                    prototypes=prototypes,
+                )
+            else:
+                out = model(data, reliability=None, domain="target", prototypes=prototypes)
             pred = out["logits"].argmax(dim=1)
             pred_np = np.asarray(pred.detach().cpu().tolist(), dtype=np.int64)
             label_np = np.asarray(label.cpu().tolist(), dtype=np.int64)
@@ -368,6 +406,7 @@ def build_arg_parser():
     parser.add_argument("--disable_domain_adapter", action="store_true")
     parser.add_argument("--disable_proto_head", action="store_true")
     parser.add_argument("--disable_spatial_reliability", action="store_true")
+    parser.add_argument("--disable_reliability_eval", action="store_true")
     parser.add_argument("--disable_proto_alignment", action="store_true")
     parser.add_argument("--disable_spatial_consistency", action="store_true")
     parser.add_argument("--disable_pseudo_ce", action="store_true")
@@ -393,6 +432,7 @@ def main():
     batch_size = int(cfg["batch_size"])
     eval_interval = int(cfg.get("eval_interval", 10))
     n_datasets = min(int(cfg.get("n_datasets", 3)), len(seeds))
+    use_reliability_eval = bool(cfg.get("use_reliability_eval", True)) and not args.disable_reliability_eval
 
     data_s, label_s = utils.load_data_houston(cfg["source_data"], cfg["source_label"])
     data_t, label_t = utils.load_data_houston(cfg["target_data"], cfg["target_label"])
@@ -804,6 +844,11 @@ def main():
                     device,
                     num_classes,
                     prototypes=eval_prototypes,
+                    use_reliability_eval=use_reliability_eval,
+                    spatial_k=int(cfg["spatial_k"]),
+                    sigma_spatial=float(cfg["sigma_spatial"]),
+                    sigma_spectral=float(cfg["sigma_spectral"]),
+                    reliability_map_sigma=float(cfg.get("reliability_map_sigma", 1.0)),
                 )
                 print_eval_result(last_result)
                 test_time += time.time() - test_begin
@@ -828,6 +873,11 @@ def main():
                         proto_count_tau=float(cfg.get("proto_count_tau", 20)),
                     )
                 ),
+                use_reliability_eval=use_reliability_eval,
+                spatial_k=int(cfg["spatial_k"]),
+                sigma_spatial=float(cfg["sigma_spatial"]),
+                sigma_spectral=float(cfg["sigma_spectral"]),
+                reliability_map_sigma=float(cfg.get("reliability_map_sigma", 1.0)),
             )
         acc_all[i_dataset] = last_result["oa"]
         class_acc_all[i_dataset, :] = last_result["class_accuracy"]

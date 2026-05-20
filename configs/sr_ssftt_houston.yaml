@@ -18,6 +18,7 @@ ema_decay: 0.999
 warmup_epochs: 10
 eval_interval: 10
 n_datasets: 3
+use_reliability_eval: true
 
 num_tokens: 8
 token_dim: 128

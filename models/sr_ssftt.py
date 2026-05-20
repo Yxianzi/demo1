@@ -104,11 +104,11 @@ class SpatialReliabilityTokenizer(nn.Module):
 
         token_weight = torch.softmax(token_logits, dim=-1)
 
-        if self.use_reliability and reliability is not None:
+        if self.use_reliability and reliability_map is None and reliability is not None:
             gamma = F.softplus(self.gamma)
             # Sample-level reliability is a coarse compatibility path. It gates
-            # all spatial locations equally and does not reshape attention like
-            # reliability_map does.
+            # all spatial locations equally, so it is only used when no spatial
+            # reliability map is available.
             rel = reliability.to(feature_map.device, feature_map.dtype).view(b, 1, 1)
             token_weight = token_weight * (1.0 + gamma * rel.clamp_min(0.0))
 
