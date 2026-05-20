@@ -63,14 +63,16 @@ class SpectralSpatialStem(nn.Module):
 class SpatialReliabilityTokenizer(nn.Module):
     """Reliability-guided tokenization over a spectral-spatial feature map.
 
-    If reliability is None, this is a normal learnable tokenizer. Otherwise,
-    token weights are scaled as:
-
-        token_weight = token_weight * (1 + gamma * reliability)
+    If reliability and reliability_map are both None, this is a normal
+    learnable tokenizer. A sample-level reliability vector [B] is kept for
+    compatibility and acts as sample-level token gating. A spatial reliability
+    map [B, H*W] or [B, H, W] directly adjusts token logits before softmax and
+    therefore changes spatial attention distribution.
 
     Input:
         feature_map: [B, D, H, W]
         reliability: [B] or None
+        reliability_map: [B, H*W], [B, H, W], or None
 
     Output:
         tokens: [B, num_tokens, token_dim]
@@ -85,15 +87,30 @@ class SpatialReliabilityTokenizer(nn.Module):
         self.token_proj = nn.Linear(in_dim, token_dim)
         self.gamma = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, feature_map, reliability=None):
+    def forward(self, feature_map, reliability=None, reliability_map=None):
         b, d, h, w = feature_map.shape
         patches = feature_map.flatten(2).transpose(1, 2)
         logits = torch.matmul(patches, self.token_queries.t()) / math.sqrt(float(d))
-        token_weight = torch.softmax(logits.transpose(1, 2), dim=-1)
+        token_logits = logits.transpose(1, 2)
+
+        if self.use_reliability and reliability_map is not None:
+            gamma = F.softplus(self.gamma)
+            rel_map = reliability_map.to(feature_map.device, feature_map.dtype)
+            if rel_map.dim() == 3:
+                rel_map = rel_map.flatten(1)
+            if rel_map.dim() != 2 or rel_map.size(0) != b or rel_map.size(1) != h * w:
+                raise ValueError("reliability_map must have shape [B, H*W] or [B, H, W].")
+            token_logits = token_logits + gamma * rel_map.clamp_min(0.0).unsqueeze(1)
+
+        token_weight = torch.softmax(token_logits, dim=-1)
 
         if self.use_reliability and reliability is not None:
+            gamma = F.softplus(self.gamma)
+            # Sample-level reliability is a coarse compatibility path. It gates
+            # all spatial locations equally and does not reshape attention like
+            # reliability_map does.
             rel = reliability.to(feature_map.device, feature_map.dtype).view(b, 1, 1)
-            token_weight = token_weight * (1.0 + self.gamma * rel.clamp_min(0.0))
+            token_weight = token_weight * (1.0 + gamma * rel.clamp_min(0.0))
 
         tokens = torch.matmul(token_weight, patches)
         return self.token_proj(tokens)
@@ -246,9 +263,13 @@ class SRSSFTT(nn.Module):
             use_proto_head=use_proto_head,
         )
 
-    def forward(self, x, reliability=None, domain="source", prototypes=None):
+    def forward(self, x, reliability=None, reliability_map=None, domain="source", prototypes=None):
         feature_map = self.stem(x)
-        tokens = self.tokenizer(feature_map, reliability=reliability)
+        tokens = self.tokenizer(
+            feature_map,
+            reliability=reliability,
+            reliability_map=reliability_map,
+        )
         tokens = self.encoder(tokens, domain=domain)
         features = tokens.mean(dim=1)
         logits, linear_logits, proto_logits = self.head(features, prototypes=prototypes)

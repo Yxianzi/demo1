@@ -23,10 +23,7 @@ import mmd
 import utils
 from UtilsCMS import ILDA
 from config_Houston import pca_n, radius, seeds
-from losses.prototype_alignment import (
-    build_fused_prototypes,
-    spatial_reliable_prototype_alignment,
-)
+from losses.prototype_alignment import spatial_reliable_prototype_alignment
 from losses.spatial_reliability import (
     boundary_preserving_spatial_consistency,
     build_target_coordinates,
@@ -34,6 +31,7 @@ from losses.spatial_reliability import (
     spatial_sort_indices,
 )
 from models.sr_ssftt import SRSSFTT
+from prototype_memory import PrototypeMemory
 from rp_utils import update_ema_teacher
 
 
@@ -159,6 +157,92 @@ def weighted_kl_loss(student_logits, teacher_probs, weight=None, mask=None):
         return per_sample.mean()
 
     return (per_sample * weight).sum() / weight.sum().clamp_min(1e-8)
+
+
+@torch.no_grad()
+def update_reliability_weighted_memory(memory, features, labels, reliability, mask):
+    """EMA-update target prototype memory with reliability-weighted means."""
+
+    if mask is None:
+        return
+    device = memory.prototypes.device
+    dtype = memory.prototypes.dtype
+    features = features.detach().to(device=device, dtype=dtype)
+    labels = labels.detach().to(device=device, dtype=torch.long).view(-1)
+    reliability = reliability.detach().to(device=device, dtype=dtype).view(-1)
+    mask = mask.detach().to(device=device, dtype=torch.bool).view(-1)
+
+    valid = mask & (labels >= 0) & (labels < memory.num_classes)
+    if not valid.any():
+        return
+
+    for class_id in range(memory.num_classes):
+        class_mask = valid & (labels == class_id)
+        if not class_mask.any():
+            continue
+
+        weights = reliability[class_mask].clamp_min(0.0)
+        weight_sum = weights.sum()
+        if weight_sum.item() <= memory.eps:
+            continue
+
+        class_mean = (features[class_mask] * weights.view(-1, 1)).sum(dim=0) / weight_sum.clamp_min(memory.eps)
+        if not memory.initialized[class_id]:
+            updated = class_mean
+            memory.initialized[class_id] = True
+        else:
+            updated = memory.momentum * memory.prototypes[class_id] + (1.0 - memory.momentum) * class_mean
+
+        memory.prototypes[class_id] = F.normalize(updated.unsqueeze(0), p=2, dim=1, eps=memory.eps).squeeze(0)
+
+
+@torch.no_grad()
+def get_fused_memory_prototypes(source_memory, target_memory, eta=0.7):
+    """Build fused prototypes from EMA source/target memories for train/eval."""
+
+    source_proto = source_memory.get()
+    target_proto = target_memory.get().to(device=source_proto.device, dtype=source_proto.dtype)
+    source_valid = source_memory.initialized
+    target_valid = target_memory.initialized.to(source_valid.device)
+    valid = source_valid | target_valid
+    if not valid.any():
+        return None
+
+    fused = source_proto.clone()
+    both_valid = source_valid & target_valid
+    target_only = (~source_valid) & target_valid
+
+    eta = float(eta)
+    if both_valid.any():
+        fused[both_valid] = eta * source_proto[both_valid] + (1.0 - eta) * target_proto[both_valid]
+    if target_only.any():
+        fused[target_only] = target_proto[target_only]
+    fused[~valid] = 0.0
+    return F.normalize(fused, p=2, dim=1, eps=1e-8)
+
+
+def compute_lmmd_loss(source_features, target_features, source_labels, target_probs, target_weight, batch_size, num_classes):
+    """Use reliability-weighted LMMD when available, otherwise fall back."""
+
+    if hasattr(mmd, "weighted_lmmd"):
+        return mmd.weighted_lmmd(
+            source_features,
+            target_features,
+            source_labels,
+            target_probs.detach(),
+            t_weight=target_weight.detach(),
+            BATCH_SIZE=batch_size,
+            CLASS_NUM=num_classes,
+        )
+
+    return mmd.lmmd(
+        source_features,
+        target_features,
+        source_labels,
+        target_probs.detach(),
+        BATCH_SIZE=batch_size,
+        CLASS_NUM=num_classes,
+    )
 
 
 def evaluate_target_domain(model, test_loader, device, num_classes, prototypes=None):
@@ -324,6 +408,17 @@ def main():
         for param in teacher_model.parameters():
             param.requires_grad = False
 
+        source_proto_memory = PrototypeMemory(
+            num_classes,
+            model.feature_dim,
+            momentum=0.9,
+        ).to(device)
+        target_proto_memory = PrototypeMemory(
+            num_classes,
+            model.feature_dim,
+            momentum=0.9,
+        ).to(device)
+
         optimizer = torch.optim.SGD(
             model.parameters(),
             lr=float(cfg["lr"]),
@@ -331,7 +426,6 @@ def main():
             weight_decay=float(cfg["weight_decay"]),
         )
 
-        current_prototypes = None
         last_result = None
         train_start = time.time()
         target_iter = iter(target_train_loader)
@@ -388,7 +482,14 @@ def main():
                 source_y_cuda = source_y.to(device)
                 target_x = target_x.to(device)
                 target_coords_batch = target_coords_batch.to(device)
-                prototypes_for_head = None if args.disable_proto_head else current_prototypes
+                if args.disable_proto_head:
+                    prototypes_for_head = None
+                else:
+                    prototypes_for_head = get_fused_memory_prototypes(
+                        source_proto_memory,
+                        target_proto_memory,
+                        eta=float(cfg.get("prototype_eta", 0.7)),
+                    )
 
                 source_out = model(
                     source_x,
@@ -470,13 +571,14 @@ def main():
                     )
 
                 source_ce = cross_entropy(source_logits, source_y_cuda)
-                lmmd_loss = mmd.lmmd(
+                lmmd_loss = compute_lmmd_loss(
                     source_features,
                     target_features,
-                    source_y,
+                    source_y_cuda,
                     refined_probs.detach(),
-                    BATCH_SIZE=batch_size,
-                    CLASS_NUM=num_classes,
+                    reliability.detach(),
+                    batch_size=batch_size,
+                    num_classes=num_classes,
                 )
                 mcc_loss = minimum_class_confusion_loss(target_logits)
 
@@ -540,16 +642,17 @@ def main():
                 update_ema_teacher(model, teacher_model, decay=float(cfg["ema_decay"]))
 
                 with torch.no_grad():
-                    current_prototypes = build_fused_prototypes(
+                    source_proto_memory.update(
                         source_features.detach(),
                         source_y_cuda.detach(),
+                    )
+                    update_reliability_weighted_memory(
+                        target_proto_memory,
                         target_features.detach(),
                         pseudo_labels.detach(),
                         reliability.detach(),
-                        num_classes,
-                        target_mask=selected_mask.detach(),
-                        eta=float(cfg.get("prototype_eta", 0.7)),
-                    ).detach()
+                        selected_mask.detach(),
+                    )
 
                 selected_hist = torch.bincount(
                     pseudo_labels[selected_mask].detach().cpu(),
@@ -601,7 +704,13 @@ def main():
             if epoch % eval_interval == 0 or epoch == epochs:
                 test_begin = time.time()
                 print("Testing epoch {} ...".format(epoch))
-                eval_prototypes = None if args.disable_proto_head else current_prototypes
+                eval_prototypes = None
+                if not args.disable_proto_head:
+                    eval_prototypes = get_fused_memory_prototypes(
+                        source_proto_memory,
+                        target_proto_memory,
+                        eta=float(cfg.get("prototype_eta", 0.7)),
+                    )
                 last_result = evaluate_target_domain(
                     model,
                     target_test_loader,
@@ -622,7 +731,15 @@ def main():
                 target_test_loader,
                 device,
                 num_classes,
-                prototypes=None if args.disable_proto_head else current_prototypes,
+                prototypes=(
+                    None
+                    if args.disable_proto_head
+                    else get_fused_memory_prototypes(
+                        source_proto_memory,
+                        target_proto_memory,
+                        eta=float(cfg.get("prototype_eta", 0.7)),
+                    )
+                ),
             )
         acc_all[i_dataset] = last_result["oa"]
         class_acc_all[i_dataset, :] = last_result["class_accuracy"]
