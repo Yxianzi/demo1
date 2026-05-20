@@ -42,10 +42,10 @@ RP_MIN_RELIABLE_SAMPLES = 4
 RP_CLASS_TOPK = 2
 RP_EVAL_INTERVAL = 10
 RP_MV_CONSIST_MIN_VOTES = 2
-RP_PROTO_MARGIN_THRESHOLD = 0.08
 RP_AGREE_WEIGHT = 1.0
 RP_DISAGREE_WEIGHT = 0.5
-RP_PROTO_ONLY_WEIGHT = 0.3
+RP_PROTO_PEAK_EPOCH = 60
+RP_PROTO_END_EPOCH = 85
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
@@ -209,11 +209,11 @@ for iDataSet in range(nDataSet):
 
             proto_loss_t2s = source_features.new_tensor(0.0)
             proto_weight = 0.0
+            selected_weight_mean = 0.0
             reliable_ratio = 0.0
             certain_num = 0
             agree_certain_num = 0
             disagree_certain_num = 0
-            proto_only_num = 0
             candidate_num = 0
             selected_num = 0
 
@@ -273,10 +273,6 @@ for iDataSet in range(nDataSet):
                         source_memory.get()
                     )
 
-                    proto_top2 = torch.topk(proto_logits_t, k=2, dim=1).values
-                    proto_conf_t = proto_top2[:, 0]
-                    proto_margin_t = proto_top2[:, 0] - proto_top2[:, 1]
-
                     proto_agree_mask = proto_pred_t == pseudo_label_t_teacher
 
                     certain_mask = reliable_mask & mv_consistent_mask
@@ -289,13 +285,6 @@ for iDataSet in range(nDataSet):
 
                     sample_weight[agree_certain_mask] = RP_AGREE_WEIGHT * conf_t[agree_certain_mask]
                     sample_weight[disagree_certain_mask] = RP_DISAGREE_WEIGHT * conf_t[disagree_certain_mask]
-
-                    proto_only_mask = (
-                        (~certain_mask)
-                        & (proto_margin_t >= RP_PROTO_MARGIN_THRESHOLD)
-                    )
-                    candidate_label[proto_only_mask] = proto_pred_t[proto_only_mask]
-                    sample_weight[proto_only_mask] = RP_PROTO_ONLY_WEIGHT * proto_margin_t[proto_only_mask].clamp(min=0.0)
 
                     candidate_mask = sample_weight > 0
 
@@ -314,15 +303,10 @@ for iDataSet in range(nDataSet):
                     certain_num = int(certain_mask.sum().item())
                     agree_certain_num = int(agree_certain_mask.sum().item())
                     disagree_certain_num = int(disagree_certain_mask.sum().item())
-                    proto_only_num = int(proto_only_mask.sum().item())
                     candidate_num = int(candidate_mask.sum().item())
                     selected_num = int(selected_mask.sum().item())
                     conf_mean = conf_t.mean().item()
                     conf_max = conf_t.max().item()
-                    proto_conf_mean = proto_conf_t.mean().item()
-                    proto_conf_max = proto_conf_t.max().item()
-                    proto_margin_mean = proto_margin_t.mean().item()
-                    proto_margin_max = proto_margin_t.max().item()
                     pseudo_hist = torch.bincount(
                         pseudo_label_t_teacher.detach().cpu(), minlength=CLASS_NUM
                     )
@@ -334,17 +318,27 @@ for iDataSet in range(nDataSet):
                     )
 
                 if epoch > RP_WARMUP_EPOCHS and selected_num >= RP_MIN_RELIABLE_SAMPLES:
-                    proto_loss_t2s = confidence_weighted_prototype_loss(
-                        features=target_features,
-                        labels=candidate_label,
-                        prototypes=source_memory.get(),
-                        confidence=sample_weight,
-                        temperature=0.1,
-                        mask=selected_mask
-                    )
+                    if epoch <= RP_PROTO_PEAK_EPOCH:
+                        progress = (epoch - RP_WARMUP_EPOCHS) / max(1, RP_PROTO_PEAK_EPOCH - RP_WARMUP_EPOCHS)
+                        proto_weight = RP_PROTO_WEIGHT * min(1.0, progress)
+                    elif epoch <= RP_PROTO_END_EPOCH:
+                        progress = (epoch - RP_PROTO_PEAK_EPOCH) / max(1, RP_PROTO_END_EPOCH - RP_PROTO_PEAK_EPOCH)
+                        proto_weight = RP_PROTO_WEIGHT * max(0.0, 1.0 - progress)
+                    else:
+                        proto_weight = 0.0
 
-                    progress = (epoch - RP_WARMUP_EPOCHS) / max(1, epochs - RP_WARMUP_EPOCHS)
-                    proto_weight = RP_PROTO_WEIGHT * min(1.0, progress)
+                    if proto_weight > 0.0:
+                        proto_loss_t2s = confidence_weighted_prototype_loss(
+                            features=target_features,
+                            labels=candidate_label,
+                            prototypes=source_memory.get(),
+                            confidence=sample_weight,
+                            temperature=0.1,
+                            mask=selected_mask
+                        )
+                        selected_weight_mean_tensor = sample_weight[selected_mask].mean().detach()
+                        proto_loss_t2s = selected_weight_mean_tensor * proto_loss_t2s
+                        selected_weight_mean = selected_weight_mean_tensor.item()
 
                 loss = loss_base + proto_weight * proto_loss_t2s
             else:
@@ -364,9 +358,9 @@ for iDataSet in range(nDataSet):
             test_accuracy = 100. * float(total_hit) / size
 
         if USE_RP:
-            print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, proto_t2s loss:{:6f}, proto weight:{:6.4f}, reliable ratio:{:6.4f}, certain num:{:>2d}, agree certain:{:>2d}, disagree certain:{:>2d}, proto only:{:>2d}, candidate num:{:>2d}, selected num:{:>2d}, conf mean:{:6.4f}, conf max:{:6.4f}, proto conf mean:{:6.4f}, proto conf max:{:6.4f}, proto margin mean:{:6.4f}, proto margin max:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, pseudo hist:{}, candidate hist:{}, selected hist:{}'
+            print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, proto_t2s loss:{:6f}, proto weight:{:6.4f}, selected weight mean:{:6.4f}, reliable ratio:{:6.4f}, certain num:{:>2d}, agree certain:{:>2d}, disagree certain:{:>2d}, candidate num:{:>2d}, selected num:{:>2d}, conf mean:{:6.4f}, conf max:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, pseudo hist:{}, candidate hist:{}, selected hist:{}'
                   .format(epoch , cls_loss.item(),lmmd_loss.item(),contrastive_loss_s.item(),contrastive_loss_t.item(),
-                   proto_loss_t2s.item(),proto_weight,reliable_ratio,certain_num,agree_certain_num,disagree_certain_num,proto_only_num,candidate_num,selected_num,conf_mean,conf_max,proto_conf_mean,proto_conf_max,proto_margin_mean,proto_margin_max,total_hit / size,loss.item(),pseudo_hist.tolist(),candidate_hist.tolist(),selected_hist.tolist()))
+                   proto_loss_t2s.item(),proto_weight,selected_weight_mean,reliable_ratio,certain_num,agree_certain_num,disagree_certain_num,candidate_num,selected_num,conf_mean,conf_max,total_hit / size,loss.item(),pseudo_hist.tolist(),candidate_hist.tolist(),selected_hist.tolist()))
         else:
             print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f},acc {:6.4f}, total loss: {:6.4f}'
                   .format(epoch , cls_loss.item(),lmmd_loss.item(),contrastive_loss_s.item(),contrastive_loss_t.item(),

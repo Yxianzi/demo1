@@ -24,8 +24,7 @@ from UtilsCMS import *
 from rp_utils import update_ema_teacher, get_reliable_pseudo_labels
 from prototype_memory import PrototypeMemory, prototype_contrastive_loss
 
-USE_RP = False
-
+USE_RP = True
 RP_FEATURE_DIM = 288
 RP_WARMUP_EPOCHS = 30
 RP_THRESHOLD_START = 0.50
@@ -37,6 +36,93 @@ RP_EVAL_INTERVAL = 10
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
     return torch.frombuffer(array, dtype=torch_dtype).reshape(array.shape)
+
+def evaluate_target_domain(model, test_loader, source_reference_data):
+    model.eval()
+    total_rewards = 0
+    predict = np.array([], dtype=np.int64)
+    labels = np.array([], dtype=np.int64)
+
+    with torch.no_grad():
+        for test_datas, test_labels in test_loader:
+            batch_size = test_labels.shape[0]
+            eval_source_data = source_reference_data[:batch_size]
+
+            (_, _, _, _, _,
+             _, _, _, test_outputs, _) = model(
+                Variable(eval_source_data).cuda(),
+                Variable(test_datas).cuda()
+            )
+
+            pred = test_outputs.data.max(1)[1]
+            pred_np = np.asarray(pred.detach().cpu().tolist(), dtype=np.int64)
+            labels_np = np.asarray(test_labels.cpu().tolist(), dtype=np.int64)
+
+            total_rewards += np.sum(pred_np == labels_np)
+            predict = np.append(predict, pred_np)
+            labels = np.append(labels, labels_np)
+
+    class_ids = np.arange(CLASS_NUM)
+    confusion = metrics.confusion_matrix(labels, predict, labels=class_ids)
+    class_totals = np.sum(confusion, axis=1, dtype=np.float64)
+    class_accuracy = np.divide(
+        np.diag(confusion),
+        class_totals,
+        out=np.zeros(CLASS_NUM, dtype=np.float64),
+        where=class_totals != 0
+    )
+    oa = 100. * total_rewards / len(test_loader.dataset)
+    aa = np.mean(class_accuracy)
+    kappa = metrics.cohen_kappa_score(labels, predict, labels=class_ids)
+
+    return {
+        'total_rewards': total_rewards,
+        'total_count': len(test_loader.dataset),
+        'predict': predict,
+        'labels': labels,
+        'oa': oa,
+        'aa': aa,
+        'kappa': kappa,
+        'class_accuracy': class_accuracy
+    }
+
+def print_eval_result(name, result):
+    print('{}:'.format(name))
+    print('\tOA: {}/{} ({:.2f}%)'.format(
+        result['total_rewards'],
+        result['total_count'],
+        result['oa']
+    ))
+    print('\tAA: {:.2f}%'.format(100 * result['aa']))
+    print('\tKappa: {:.4f}'.format(100 * result['kappa']))
+    print('\taccuracy for each class:')
+    for class_id in range(CLASS_NUM):
+        print('\tClass {}: {:.2f}'.format(
+            class_id,
+            100 * result['class_accuracy'][class_id]
+        ))
+
+def print_average_result(name, acc_values, class_acc_values, kappa_values):
+    aa = np.mean(class_acc_values, 1)
+    aa_mean = np.mean(aa, 0)
+    aa_std = np.std(aa)
+    class_mean = np.mean(class_acc_values, 0)
+    class_std = np.std(class_acc_values, 0)
+    oa_mean = np.mean(acc_values)
+    oa_std = np.std(acc_values)
+    kappa_mean = np.mean(kappa_values)
+    kappa_std = np.std(kappa_values)
+
+    print('average {} OA: {:.2f} +- {:.2f}'.format(name, oa_mean, oa_std))
+    print('average {} AA: {:.2f} +- {:.2f}'.format(name, 100 * aa_mean, 100 * aa_std))
+    print('average {} Kappa: {:.4f} +- {:.4f}'.format(name, 100 * kappa_mean, 100 * kappa_std))
+    print('{} accuracy for each class:'.format(name))
+    for class_id in range(CLASS_NUM):
+        print('Class {}: {:.2f} +- {:.2f}'.format(
+            class_id,
+            100 * class_mean[class_id],
+            100 * class_std[class_id]
+        ))
 
 ##################################
 data_path_s = './datasets/Houston/Houston13.mat'
@@ -55,9 +141,12 @@ ContrastiveLoss_s = SupConLoss(temperature=0.1).cuda()
 ContrastiveLoss_t = SupConLoss(temperature=0.1).cuda()
 DSH_loss = utils.Domain_Occ_loss().cuda()
 
-acc = np.zeros([nDataSet, 1])
-A = np.zeros([nDataSet, CLASS_NUM])
-k = np.zeros([nDataSet, 1])
+student_acc = np.zeros([nDataSet, 1])
+student_A = np.zeros([nDataSet, CLASS_NUM])
+student_k = np.zeros([nDataSet, 1])
+teacher_acc = np.zeros([nDataSet, 1])
+teacher_A = np.zeros([nDataSet, CLASS_NUM])
+teacher_k = np.zeros([nDataSet, 1])
 best_predict_all = []
 best_acc_all = 0.0
 best_G,best_RandPerm,best_Row, best_Column,best_nTrain = None,None,None,None,None
@@ -99,8 +188,10 @@ for iDataSet in range(nDataSet):
 
     print("Training...")
 
-    last_accuracy = 0.0
-    best_episdoe = 0
+    last_student_accuracy = 0.0
+    last_teacher_accuracy = 0.0
+    best_student_episdoe = 0
+    best_teacher_episdoe = 0
     train_loss = []
     test_acc = []
     running_D_loss, running_F_loss = 0.0, 0.0
@@ -258,86 +349,79 @@ for iDataSet in range(nDataSet):
 
         train_end = time.time()
         if epoch % RP_EVAL_INTERVAL == 0 or epoch == epochs:
-            # print("Testing ...")
-            feature_encoder.eval()
-            total_rewards = 0
-            counter = 0
-            accuracies = []
-            predict = np.array([], dtype=np.int64)
-            labels = np.array([], dtype=np.int64)
-            with torch.no_grad():
-                for test_datas, test_labels in test_loader:
-                    batch_size = test_labels.shape[0]
-                    eval_source_data = source_data[:batch_size]
+            print('Testing epoch {} ...'.format(epoch))
+            student_result = evaluate_target_domain(feature_encoder, test_loader, source_data)
+            student_acc[iDataSet] = student_result['oa']
+            student_A[iDataSet, :] = student_result['class_accuracy']
+            student_k[iDataSet] = student_result['kappa']
+            print_eval_result('Student', student_result)
 
-                    source_features, source1, _, source_outputs, source_out, test_features, _, _, test_outputs, _ = feature_encoder(
-                            Variable(eval_source_data).cuda(), Variable(test_datas).cuda())
+            if USE_RP:
+                teacher_result = evaluate_target_domain(teacher_encoder, test_loader, source_data)
+                teacher_acc[iDataSet] = teacher_result['oa']
+                teacher_A[iDataSet, :] = teacher_result['class_accuracy']
+                teacher_k[iDataSet] = teacher_result['kappa']
+                print_eval_result('EMA Teacher', teacher_result)
 
-                    pred = test_outputs.data.max(1)[1]
-
-                    pred_np = np.asarray(pred.detach().cpu().tolist(), dtype=np.int64)
-                    test_labels = np.asarray(test_labels.cpu().tolist(), dtype=np.int64)
-                    rewards = [1 if pred_np[j] == test_labels[j] else 0 for j in range(batch_size)]
-
-                    total_rewards += np.sum(rewards)
-                    counter += batch_size
-
-                    predict = np.append(predict, pred_np)
-                    labels = np.append(labels, test_labels)
-
-                    accuracy = total_rewards / 1.0 / counter  #
-                    accuracies.append(accuracy)
-
-            test_accuracy = 100. * total_rewards / len(test_loader.dataset)
-            acc[iDataSet] = 100. * total_rewards / len(test_loader.dataset)
-            OA = acc
-            C = metrics.confusion_matrix(labels, predict)
-            A[iDataSet, :] = np.diag(C) / np.sum(C, 1, dtype=np.float64)
-
-            k[iDataSet] = metrics.cohen_kappa_score(labels, predict)
-            print('\t\tAccuracy: {}/{} ({:.2f}%)\n'.format(total_rewards, len(test_loader.dataset),
-                                                           100. * total_rewards / len(test_loader.dataset)))
             test_end = time.time()
 
             # Training mode
 
-            if test_accuracy > last_accuracy:
+            if student_result['oa'] > last_student_accuracy:
                 # save networks
                 # torch.save(feature_encoder.state_dict(),str("../checkpoints/DFSL_feature_encoder_" + "houston_cl_lmmd_dis_attention" +str(iDataSet) +".pkl"))
-                print("save networks for epoch:", epoch + 1)
-                last_accuracy = test_accuracy
-                best_episdoe = epoch
-                best_predict_all = predict
+                print("save student networks for epoch:", epoch + 1)
+                last_student_accuracy = student_result['oa']
+                best_student_episdoe = epoch
+                best_predict_all = student_result['predict']
                 best_G, best_RandPerm, best_Row, best_Column = G, RandPerm, Row, Column
-                print('best epoch:[{}], best accuracy={}'.format(best_episdoe + 1, last_accuracy))
+                print('best student epoch:[{}], best student accuracy={}'.format(
+                    best_student_episdoe + 1,
+                    last_student_accuracy
+                ))
 
-            print('iter:{} best epoch:[{}], best accuracy={}'.format(iDataSet, best_episdoe + 1, last_accuracy))
+            if USE_RP and teacher_result['oa'] > last_teacher_accuracy:
+                print("save teacher networks for epoch:", epoch + 1)
+                last_teacher_accuracy = teacher_result['oa']
+                best_teacher_episdoe = epoch
+                print('best teacher epoch:[{}], best teacher accuracy={}'.format(
+                    best_teacher_episdoe + 1,
+                    last_teacher_accuracy
+                ))
+
+            print('iter:{} best student epoch:[{}], best student accuracy={}'.format(
+                iDataSet,
+                best_student_episdoe + 1,
+                last_student_accuracy
+            ))
+            if USE_RP:
+                print('iter:{} best teacher epoch:[{}], best teacher accuracy={}'.format(
+                    iDataSet,
+                    best_teacher_episdoe + 1,
+                    last_teacher_accuracy
+                ))
             print('***********************************************************************************')
 
-AA = np.mean(A, 1)
-AAMean = np.mean(AA,0)
-AAStd = np.std(AA)
-AMean = np.mean(A, 0)
-AStd = np.std(A, 0)
-OAMean = np.mean(acc)
-OAStd = np.std(acc)
-kMean = np.mean(k)
-kStd = np.std(k)
 print ("train time per DataSet(s): " + "{:.5f}".format(train_end-train_start))
 print("test time per DataSet(s): " + "{:.5f}".format(test_end-train_end))
-print ("average OA: " + "{:.2f}".format( OAMean) + " +- " + "{:.2f}".format( OAStd))
-print ("average AA: " + "{:.2f}".format(100 * AAMean) + " +- " + "{:.2f}".format(100 * AAStd))
-print ("average kappa: " + "{:.4f}".format(100 *kMean) + " +- " + "{:.4f}".format(100 *kStd))
-print ("accuracy for each class: ")
-for i in range(CLASS_NUM):
-    print ("Class " + str(i) + ": " + "{:.2f}".format(100 * AMean[i]) + " +- " + "{:.2f}".format(100 * AStd[i]))
+print_average_result('Student', student_acc, student_A, student_k)
+if USE_RP:
+    print_average_result('Teacher', teacher_acc, teacher_A, teacher_k)
 
 best_iDataset = 0
-for i in range(len(acc)):
-    print('{}:{}'.format(i, acc[i]))
-    if acc[i] > acc[best_iDataset]:
+for i in range(len(student_acc)):
+    print('{}:{}'.format(i, student_acc[i]))
+    if student_acc[i] > student_acc[best_iDataset]:
         best_iDataset = i
-print('best acc all={}'.format(acc[best_iDataset]))
+print('best student acc all={}'.format(student_acc[best_iDataset]))
+
+if USE_RP:
+    best_teacher_iDataset = 0
+    for i in range(len(teacher_acc)):
+        print('teacher {}:{}'.format(i, teacher_acc[i]))
+        if teacher_acc[i] > teacher_acc[best_teacher_iDataset]:
+            best_teacher_iDataset = i
+    print('best teacher acc all={}'.format(teacher_acc[best_teacher_iDataset]))
 
 #################classification map################################
 
