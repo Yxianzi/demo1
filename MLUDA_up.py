@@ -21,6 +21,10 @@ from config_UP2PC import *
 from sklearn import svm
 from UtilsCMS import *
 
+def numpy_to_tensor(data, numpy_dtype, torch_dtype):
+    array = np.ascontiguousarray(data, dtype=numpy_dtype)
+    return torch.frombuffer(array, dtype=torch_dtype).reshape(array.shape)
+
 ##################################
 data_path_s = './datasets/Pavia/paviaU.mat'
 label_path_s = './datasets/Pavia/paviaU_gt_7.mat'
@@ -54,8 +58,14 @@ for iDataSet in range(nDataSet):
     trainX, trainY = utils.get_sample_data(data_s, label_s, HalfWidth, 180)
     testID, testX, testY, G, RandPerm, Row, Column = utils.get_all_data(data_t, label_t, HalfWidth)
 
-    train_dataset = TensorDataset(torch.tensor(trainX), torch.tensor(trainY))
-    test_dataset = TensorDataset(torch.tensor(testX), torch.tensor(testY))
+    train_dataset = TensorDataset(
+        numpy_to_tensor(trainX, np.float32, torch.float32),
+        numpy_to_tensor(trainY, np.int64, torch.long)
+    )
+    test_dataset = TensorDataset(
+        numpy_to_tensor(testX, np.float32, torch.float32),
+        numpy_to_tensor(testY, np.int64, torch.long)
+    )
 
     train_loader_s = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
@@ -177,8 +187,8 @@ for iDataSet in range(nDataSet):
             total_rewards = 0
             counter = 0
             accuracies = []
-            predict = np.array([], dtype=np.int64)
-            labels = np.array([], dtype=np.int64)
+            predict_list = []
+            label_list = []
             with torch.no_grad():
                 for test_datas, test_labels in test_loader:
                     batch_size = test_labels.shape[0]
@@ -188,18 +198,21 @@ for iDataSet in range(nDataSet):
 
                     pred = test_outputs.data.max(1)[1]
 
-                    test_labels = test_labels.numpy()
-                    rewards = [1 if pred[j] == test_labels[j] else 0 for j in range(batch_size)]
+                    pred_np = np.asarray(pred.detach().cpu().tolist(), dtype=np.int64)
+                    test_labels = np.asarray(test_labels.cpu().tolist(), dtype=np.int64)
+                    rewards = [1 if pred_np[j] == test_labels[j] else 0 for j in range(batch_size)]
 
                     total_rewards += np.sum(rewards)
                     counter += batch_size
 
-                    predict = np.append(predict, pred.cpu().numpy())
-                    labels = np.append(labels, test_labels)
+                    predict_list.append(pred_np)
+                    label_list.append(test_labels)
 
                     accuracy = total_rewards / 1.0 / counter  #
                     accuracies.append(accuracy)
 
+            predict = np.concatenate(predict_list) if predict_list else np.array([], dtype=np.int64)
+            labels = np.concatenate(label_list) if label_list else np.array([], dtype=np.int64)
             test_accuracy = 100. * total_rewards / len(test_loader.dataset)
             acc[iDataSet] = 100. * total_rewards / len(test_loader.dataset)
             OA = acc
