@@ -19,28 +19,31 @@ warmup_epochs: 10
 eval_interval: 10
 n_datasets: 3
 
-num_tokens: 4
-token_dim: 64
-transformer_depth: 2
+num_tokens: 8
+token_dim: 128
+transformer_depth: 3
 num_heads: 4
 adapter_bottleneck: 64
 proto_temperature: 0.1
 proto_logit_weight: 0.5
-prototype_eta: 0.7
+proto_count_tau: 20
+min_proto_update_per_class: 3
 
 lambda_lmmd: 0.01
 lambda_mcc: 0.10
-lambda_pseudo: 0.30
-lambda_proto: 0.10
-lambda_sp_pred: 0.10
-lambda_sp_feat: 0.02
-lambda_cons: 0.05
+lambda_pseudo: 0.10
+lambda_proto: 0.05
+lambda_sp_pred: 0.05
+lambda_sp_feat: 0.01
+lambda_cons: 0.02
+lambda_div: 0.05
 
-pseudo_threshold_start: 0.85
-pseudo_threshold_end: 0.65
-topk_per_class: 4
+pseudo_threshold_start: 0.45
+pseudo_threshold_end: 0.50
+topk_per_class: 8
 
 spatial_k: 6
 sigma_spatial: 2.5
 sigma_spectral: 1.0
 spatial_vote_alpha: 0.35
+reliability_map_sigma: 1.0

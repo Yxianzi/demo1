@@ -107,6 +107,22 @@ def minimum_class_confusion_loss(logits, temperature=2.5):
     return off_diag / num_classes
 
 
+def target_diversity_loss(target_logits):
+    probs = F.softmax(target_logits, dim=1)
+    mean_probs = probs.mean(dim=0)
+    return torch.sum(mean_probs * torch.log(mean_probs.clamp_min(1e-8)))
+
+
+def build_patch_reliability_map(target_x, reliability, sigma=1.0):
+    b, c, h, w = target_x.shape
+    center = target_x[:, :, h // 2, w // 2].view(b, c, 1, 1)
+    dist = ((target_x - center) ** 2).mean(dim=1)
+    safe_sigma = max(float(sigma), 1e-6)
+    sim = torch.exp(-dist / (2 * safe_sigma**2))
+    reliability = reliability.to(device=target_x.device, dtype=target_x.dtype).view(b, 1, 1)
+    return reliability * sim
+
+
 def spatial_voting_refinement(base_probs, affinity, alpha):
     """Blend sample probabilities with spatial-spectral neighbor votes."""
 
@@ -117,21 +133,34 @@ def spatial_voting_refinement(base_probs, affinity, alpha):
     return refined / refined.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
 
-def class_balanced_reliable_selection(labels, scores, threshold, topk_per_class, num_classes):
-    """Select at most top-k reliable target samples for each pseudo class."""
+def class_balanced_reliable_selection(labels, scores, min_threshold=0.45, topk_per_class=8, num_classes=None):
+    """Select top-k reliable target samples independently within each pseudo class."""
+
+    labels = labels.to(dtype=torch.long).view(-1)
+    scores = scores.to(device=labels.device).view(-1)
+    if num_classes is None:
+        num_classes = int(labels.max().item()) + 1 if labels.numel() > 0 else 0
 
     selected = torch.zeros_like(labels, dtype=torch.bool)
-    candidate = scores > threshold
+    selected_per_class = torch.zeros(int(num_classes), device=labels.device, dtype=torch.long)
+    if int(topk_per_class) <= 0:
+        return selected, selected_per_class
+
     for class_id in range(num_classes):
-        class_mask = candidate & (labels == class_id)
+        class_mask = labels == class_id
         index = torch.nonzero(class_mask, as_tuple=False).view(-1)
         if index.numel() == 0:
             continue
         class_scores = scores[index]
         keep = min(int(topk_per_class), index.numel())
-        order = torch.argsort(class_scores, descending=True)[:keep]
-        selected[index[order]] = True
-    return selected
+        order = torch.argsort(class_scores, descending=True)
+        top_index = index[order[:keep]]
+        top_index = top_index[scores[top_index] >= float(min_threshold)]
+        if top_index.numel() == 0:
+            continue
+        selected[top_index] = True
+        selected_per_class[class_id] = top_index.numel()
+    return selected, selected_per_class
 
 
 def weighted_kl_loss(student_logits, teacher_probs, weight=None, mask=None):
@@ -160,12 +189,20 @@ def weighted_kl_loss(student_logits, teacher_probs, weight=None, mask=None):
 
 
 @torch.no_grad()
-def update_reliability_weighted_memory(memory, features, labels, reliability, mask):
+def update_reliability_weighted_memory(
+    memory,
+    features,
+    labels,
+    reliability,
+    mask,
+    min_count_per_class=1,
+):
     """EMA-update target prototype memory with reliability-weighted means."""
 
-    if mask is None:
-        return
     device = memory.prototypes.device
+    update_counts = torch.zeros(memory.num_classes, device=device, dtype=torch.long)
+    if mask is None:
+        return update_counts
     dtype = memory.prototypes.dtype
     features = features.detach().to(device=device, dtype=dtype)
     labels = labels.detach().to(device=device, dtype=torch.long).view(-1)
@@ -174,11 +211,12 @@ def update_reliability_weighted_memory(memory, features, labels, reliability, ma
 
     valid = mask & (labels >= 0) & (labels < memory.num_classes)
     if not valid.any():
-        return
+        return update_counts
 
     for class_id in range(memory.num_classes):
         class_mask = valid & (labels == class_id)
-        if not class_mask.any():
+        class_count = int(class_mask.sum().item())
+        if class_count < int(min_count_per_class):
             continue
 
         weights = reliability[class_mask].clamp_min(0.0)
@@ -194,10 +232,13 @@ def update_reliability_weighted_memory(memory, features, labels, reliability, ma
             updated = memory.momentum * memory.prototypes[class_id] + (1.0 - memory.momentum) * class_mean
 
         memory.prototypes[class_id] = F.normalize(updated.unsqueeze(0), p=2, dim=1, eps=memory.eps).squeeze(0)
+        update_counts[class_id] = class_count
+
+    return update_counts
 
 
 @torch.no_grad()
-def get_fused_memory_prototypes(source_memory, target_memory, eta=0.7):
+def get_fused_memory_prototypes(source_memory, target_memory, target_counts=None, proto_count_tau=20):
     """Build fused prototypes from EMA source/target memories for train/eval."""
 
     source_proto = source_memory.get()
@@ -210,11 +251,17 @@ def get_fused_memory_prototypes(source_memory, target_memory, eta=0.7):
 
     fused = source_proto.clone()
     both_valid = source_valid & target_valid
-    target_only = (~source_valid) & target_valid
+    if target_counts is None:
+        target_counts = torch.zeros(source_memory.num_classes, device=source_proto.device, dtype=source_proto.dtype)
+    else:
+        target_counts = target_counts.to(device=source_proto.device, dtype=source_proto.dtype).view(-1)
+    safe_tau = max(float(proto_count_tau), 1e-6)
+    target_ratio = target_counts / (target_counts + safe_tau)
+    target_only = (~source_valid) & target_valid & (target_counts > 0)
 
-    eta = float(eta)
     if both_valid.any():
-        fused[both_valid] = eta * source_proto[both_valid] + (1.0 - eta) * target_proto[both_valid]
+        ratio = target_ratio[both_valid].view(-1, 1)
+        fused[both_valid] = (1.0 - ratio) * source_proto[both_valid] + ratio * target_proto[both_valid]
     if target_only.any():
         fused[target_only] = target_proto[target_only]
     fused[~valid] = 0.0
@@ -418,6 +465,7 @@ def main():
             model.feature_dim,
             momentum=0.9,
         ).to(device)
+        target_proto_counts = torch.zeros(num_classes, device=device, dtype=torch.long)
 
         optimizer = torch.optim.SGD(
             model.parameters(),
@@ -455,12 +503,18 @@ def main():
                 "sp_pred": 0.0,
                 "sp_feat": 0.0,
                 "cons": 0.0,
+                "diversity": 0.0,
                 "reliability_mean": 0.0,
                 "reliability_max": 0.0,
                 "selected_num": 0,
                 "loss": 0.0,
             }
             selected_per_class = torch.zeros(num_classes, dtype=torch.long)
+            target_prob_sum = torch.zeros(num_classes, dtype=torch.float64)
+            target_prob_count = 0
+            epoch_target_features = []
+            epoch_target_labels = []
+            epoch_target_reliability = []
             num_batches = 0
             threshold = dynamic_threshold(
                 epoch,
@@ -488,7 +542,8 @@ def main():
                     prototypes_for_head = get_fused_memory_prototypes(
                         source_proto_memory,
                         target_proto_memory,
-                        eta=float(cfg.get("prototype_eta", 0.7)),
+                        target_counts=target_proto_counts,
+                        proto_count_tau=float(cfg.get("proto_count_tau", 20)),
                     )
 
                 source_out = model(
@@ -530,7 +585,6 @@ def main():
                         "reliability_max": float(reliability.max().item()),
                         "edge_num": 0,
                     }
-                    target_reliability_for_tokenizer = None
                 else:
                     reliability, affinity, spatial_stats = compute_spatial_reliability(
                         pre_probs,
@@ -540,11 +594,18 @@ def main():
                         sigma_spatial=float(cfg["sigma_spatial"]),
                         sigma_spectral=float(cfg["sigma_spectral"]),
                     )
-                    target_reliability_for_tokenizer = reliability.detach()
+
+                target_reliability_for_tokenizer = reliability.detach()
+                target_reliability_map = build_patch_reliability_map(
+                    target_x,
+                    target_reliability_for_tokenizer,
+                    sigma=float(cfg.get("reliability_map_sigma", 1.0)),
+                )
 
                 target_out = model(
                     target_x,
                     reliability=target_reliability_for_tokenizer,
+                    reliability_map=target_reliability_map,
                     domain="target",
                     prototypes=prototypes_for_head,
                 )
@@ -553,6 +614,8 @@ def main():
                 source_logits = source_out["logits"]
                 target_logits = target_out["logits"]
                 target_probs = F.softmax(target_logits, dim=1)
+                target_prob_sum += target_probs.detach().sum(dim=0).cpu().double()
+                target_prob_count += int(target_probs.size(0))
 
                 with torch.no_grad():
                     refinement_base = 0.5 * target_probs.detach() + 0.5 * teacher_probs.detach()
@@ -562,12 +625,12 @@ def main():
                         alpha=float(cfg["spatial_vote_alpha"]),
                     )
                     pseudo_labels = refined_probs.argmax(dim=1)
-                    selected_mask = class_balanced_reliable_selection(
+                    selected_mask, batch_selected_per_class = class_balanced_reliable_selection(
                         pseudo_labels,
                         reliability.detach(),
-                        threshold,
-                        int(cfg["topk_per_class"]),
-                        num_classes,
+                        min_threshold=threshold,
+                        topk_per_class=int(cfg["topk_per_class"]),
+                        num_classes=num_classes,
                     )
 
                 source_ce = cross_entropy(source_logits, source_y_cuda)
@@ -581,6 +644,7 @@ def main():
                     num_classes=num_classes,
                 )
                 mcc_loss = minimum_class_confusion_loss(target_logits)
+                diversity_loss = target_diversity_loss(target_logits)
 
                 if selected_mask.any() and not args.disable_pseudo_ce:
                     pseudo_ce_loss = F.cross_entropy(target_logits[selected_mask], pseudo_labels[selected_mask])
@@ -634,7 +698,7 @@ def main():
                     + float(cfg["lambda_sp_feat"]) * spatial_feat_loss
                     + float(cfg["lambda_cons"]) * teacher_consistency_loss
                 )
-                total_loss = loss_warm + ramp * loss_extra
+                total_loss = loss_warm + ramp * loss_extra + float(cfg.get("lambda_div", 0.05)) * diversity_loss
 
                 optimizer.zero_grad()
                 total_loss.backward()
@@ -646,19 +710,13 @@ def main():
                         source_features.detach(),
                         source_y_cuda.detach(),
                     )
-                    update_reliability_weighted_memory(
-                        target_proto_memory,
-                        target_features.detach(),
-                        pseudo_labels.detach(),
-                        reliability.detach(),
-                        selected_mask.detach(),
-                    )
+                    if selected_mask.any():
+                        selected_detached = selected_mask.detach()
+                        epoch_target_features.append(target_features.detach()[selected_detached])
+                        epoch_target_labels.append(pseudo_labels.detach()[selected_detached])
+                        epoch_target_reliability.append(reliability.detach()[selected_detached])
 
-                selected_hist = torch.bincount(
-                    pseudo_labels[selected_mask].detach().cpu(),
-                    minlength=num_classes,
-                )
-                selected_per_class += selected_hist
+                selected_per_class += batch_selected_per_class.detach().cpu()
                 meter["source_ce"] += float(source_ce.item())
                 meter["lmmd"] += float(lmmd_loss.item())
                 meter["mcc"] += float(mcc_loss.item())
@@ -667,20 +725,44 @@ def main():
                 meter["sp_pred"] += float(spatial_pred_loss.item())
                 meter["sp_feat"] += float(spatial_feat_loss.item())
                 meter["cons"] += float(teacher_consistency_loss.item())
+                meter["diversity"] += float(diversity_loss.item())
                 meter["reliability_mean"] += float(spatial_stats["reliability_mean"])
                 meter["reliability_max"] += float(spatial_stats["reliability_max"])
                 meter["selected_num"] += int(selected_mask.sum().item())
                 meter["loss"] += float(total_loss.item())
                 num_batches += 1
 
+            if epoch_target_features:
+                epoch_features = torch.cat(epoch_target_features, dim=0)
+                epoch_labels = torch.cat(epoch_target_labels, dim=0)
+                epoch_reliability = torch.cat(epoch_target_reliability, dim=0)
+                epoch_mask = torch.ones(epoch_labels.size(0), device=epoch_labels.device, dtype=torch.bool)
+                target_proto_update_per_class = update_reliability_weighted_memory(
+                    target_proto_memory,
+                    epoch_features,
+                    epoch_labels,
+                    epoch_reliability,
+                    epoch_mask,
+                    min_count_per_class=int(cfg.get("min_proto_update_per_class", 3)),
+                )
+            else:
+                target_proto_update_per_class = torch.zeros(num_classes, device=device, dtype=torch.long)
+
+            target_proto_counts = selected_per_class.to(device=device)
+            mean_target_probs = (target_prob_sum / max(1, target_prob_count)).tolist()
+            mean_target_probs = [round(float(prob), 4) for prob in mean_target_probs]
+            target_proto_update_list = target_proto_update_per_class.detach().cpu().tolist()
+            target_proto_initialized = target_proto_memory.initialized.detach().cpu().tolist()
             denom = max(1, num_batches)
             print(
                 "epoch {:>3d}: lr:{:.5f}, source_ce:{:6.4f}, lmmd_loss:{:6.4f}, "
                 "mcc_loss:{:6.4f}, pseudo_ce_loss:{:6.4f}, proto_align_loss:{:6.4f}, "
                 "spatial_pred_loss:{:6.4f}, spatial_feat_loss:{:6.4f}, "
-                "teacher_consistency_loss:{:6.4f}, reliability_mean:{:6.4f}, "
+                "teacher_consistency_loss:{:6.4f}, diversity_loss:{:6.4f}, "
+                "reliability_mean:{:6.4f}, "
                 "reliability_max:{:6.4f}, selected_pseudo_num:{:>4d}, "
-                "selected_per_class:{}, threshold:{:6.4f}, ramp:{:6.4f}, total_loss:{:6.4f}".format(
+                "mean_target_probs:{}, selected_per_class:{}, target_proto_update_per_class:{}, "
+                "target_proto_initialized:{}, threshold:{:6.4f}, ramp:{:6.4f}, total_loss:{:6.4f}".format(
                     epoch,
                     learning_rate,
                     meter["source_ce"] / denom,
@@ -691,10 +773,14 @@ def main():
                     meter["sp_pred"] / denom,
                     meter["sp_feat"] / denom,
                     meter["cons"] / denom,
+                    meter["diversity"] / denom,
                     meter["reliability_mean"] / denom,
                     meter["reliability_max"] / denom,
                     meter["selected_num"],
+                    mean_target_probs,
                     selected_per_class.tolist(),
+                    target_proto_update_list,
+                    target_proto_initialized,
                     threshold,
                     ramp,
                     meter["loss"] / denom,
@@ -709,7 +795,8 @@ def main():
                     eval_prototypes = get_fused_memory_prototypes(
                         source_proto_memory,
                         target_proto_memory,
-                        eta=float(cfg.get("prototype_eta", 0.7)),
+                        target_counts=target_proto_counts,
+                        proto_count_tau=float(cfg.get("proto_count_tau", 20)),
                     )
                 last_result = evaluate_target_domain(
                     model,
@@ -737,7 +824,8 @@ def main():
                     else get_fused_memory_prototypes(
                         source_proto_memory,
                         target_proto_memory,
-                        eta=float(cfg.get("prototype_eta", 0.7)),
+                        target_counts=target_proto_counts,
+                        proto_count_tau=float(cfg.get("proto_count_tau", 20)),
                     )
                 ),
             )
