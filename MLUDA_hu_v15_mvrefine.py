@@ -32,7 +32,7 @@ MV_THRESHOLD_START = 0.80
 MV_THRESHOLD_END = 0.65
 MV_PAIR_DELTA = 0.05
 MV_PAIR_WEIGHT = 0.7
-MV_LMMD_BLEND_MAX = 0.5
+MV_LMMD_BLEND_MAX = 0.3
 RP_EVAL_INTERVAL = 10
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
