@@ -2,7 +2,7 @@
 # Author：Mingshuo Cai
 # Create_time：2023-08-01
 # Updata_time：2024-03-15
-# Usage：Implementation of the MLUDA method on the Houston cross-domain dataset
+# Usage：Implementation of the MLUDA method on the Pavia cross-domain dataset
 
 import math
 import copy
@@ -18,7 +18,7 @@ import time
 import utils
 from torch.utils.data import TensorDataset, DataLoader
 from contrastive_loss import SupConLoss, SafeWeightedSupConLoss
-from config_Houston import *
+from config_UP2PC import *
 from sklearn import svm
 from UtilsCMS import *
 from rp_utils import update_ema_teacher
@@ -26,7 +26,7 @@ from mv_refine import multiview_refine_pseudo_labels
 
 USE_MVREFINE_V15 = True
 USE_EMA_TEACHER = True
-USE_CB_RPLS = False
+USE_CB_RPLS = True
 USE_EW_TMCC = True
 
 MV_WARMUP_EPOCHS = 20
@@ -168,13 +168,14 @@ def print_average_result(name, acc_values, class_acc_values, kappa_values):
         ))
 
 ##################################
-data_path_s = './datasets/Houston/Houston13.mat'
-label_path_s = './datasets/Houston/Houston13_7gt.mat'
-data_path_t = './datasets/Houston/Houston18.mat'
-label_path_t = './datasets/Houston/Houston18_7gt.mat'
-
-data_s,label_s = utils.load_data_houston(data_path_s,label_path_s)
-data_t,label_t = utils.load_data_houston(data_path_t,label_path_t)
+data_path_s = './datasets/Pavia/paviaU.mat'
+label_path_s = './datasets/Pavia/paviaU_gt_7.mat'
+data_path_t = './datasets/Pavia/pavia.mat'
+label_path_t = './datasets/Pavia/pavia_gt_7.mat'
+data_s, label_s = utils.load_data_pavia(data_path_s, label_path_s)
+data_t, label_t = utils.load_data_pavia(data_path_t, label_path_t)
+print(data_s.shape, label_s.shape)
+print(data_t.shape, label_t.shape)
 
 data_s,data_t = ILDA(data_s,data_t,pca_n,radius)
 
@@ -407,14 +408,17 @@ for iDataSet in range(nDataSet):
             else:
                 lmmd_loss = lmmd_loss_base
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
-            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS:
-                target_con_progress = min(
-                    1.0,
-                    max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
-                )
-                target_con_weight = LAMBDA_TGT_CON * target_con_progress
+            if USE_CB_RPLS:
+                if epoch > RPLS_WARMUP_EPOCHS:
+                    target_con_progress = min(
+                        1.0,
+                        max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
+                    )
+                    target_con_weight = LAMBDA_TGT_CON * target_con_progress
+                else:
+                    target_con_weight = 0.0
             else:
-                target_con_weight = 0.0
+                target_con_weight = LAMBDA_TGT_CON
             # Loss Con_s
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
@@ -452,6 +456,8 @@ for iDataSet in range(nDataSet):
                     )
             else:
                 tmcc_loss = target_features.new_tensor(0.0)
+            if not torch.isfinite(tmcc_loss).item():
+                tmcc_loss = target_features.new_tensor(0.0)
 
             if reliable_mask.sum().item() > 0:
                 weight_mean = float(sample_weight[reliable_mask].mean().item())
@@ -485,7 +491,7 @@ for iDataSet in range(nDataSet):
 
             test_accuracy = 100. * float(total_hit) / size
 
-        print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, tmcc loss:{:6f}, lmmd rho:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, reliable weight mean:{:6.4f}, ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted num:{:>2d}, class cap:{:>2d}, accepted nz:{:>2d}, accepted top:{:6.4f}, accepted weight mean:{:6.4f}, candidate num:{:>2d}, candidate ratio:{:6.4f}, per class k:{:>2d}, topk ratio:{:6.4f}, ts agree:{:>2d}, teacher stronger:{:>2d}, rejected disagree:{:>2d}, student nz:{:>2d}, refined nz:{:>2d}, student top:{:6.4f}, refined top:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student hist:{}, refined hist:{}, accepted hist:{}'
+        print('epoch {:>3d}:   cls loss: {:6.4f}, lmmd loss:{:6f}, con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, tmcc loss:{:6f}, lmmd rho:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, reliable weight mean:{:6.4f}, ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted_num:{:>2d}, class cap:{:>2d}, accepted_nonzero:{:>2d}, accepted_top_ratio:{:6.4f}, accepted weight mean:{:6.4f}, candidate num:{:>2d}, candidate ratio:{:6.4f}, per class k:{:>2d}, topk ratio:{:6.4f}, ts agree:{:>2d}, teacher stronger:{:>2d}, rejected disagree:{:>2d}, student_nonzero:{:>2d}, refined_nonzero:{:>2d}, student_top_ratio:{:6.4f}, refined_top_ratio:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student_hist:{}, refined_hist:{}, accepted_hist:{}'
               .format(epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
                contrastive_loss_t.item(), domain_similar_loss.item(), tmcc_loss.item(), lmmd_rho,
                target_con_weight, target_con_num, weight_mean, ema_decay,
@@ -525,7 +531,7 @@ for iDataSet in range(nDataSet):
 
             if student_result['oa'] > last_student_accuracy:
                 # save networks
-                # torch.save(feature_encoder.state_dict(),str("../checkpoints/DFSL_feature_encoder_" + "houston_cl_lmmd_dis_attention" +str(iDataSet) +".pkl"))
+                # torch.save(feature_encoder.state_dict(),str("../checkpoints/DFSL_feature_encoder_" + "pavia_v15_mvrefine" +str(iDataSet) +".pkl"))
                 print("save student networks for epoch:", epoch + 1)
                 last_student_accuracy = student_result['oa']
                 best_student_episdoe = epoch
