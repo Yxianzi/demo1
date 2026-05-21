@@ -170,7 +170,8 @@ for iDataSet in range(nDataSet):
         total_hit / size,loss.item()))
 
         train_end = time.time()
-        if epoch % epochs == 0:
+        if epoch % 10 == 0 or epoch == epochs:
+            print("Testing epoch {} ...".format(epoch))
             feature_encoder.eval()
             total_rewards = 0
             counter = 0
