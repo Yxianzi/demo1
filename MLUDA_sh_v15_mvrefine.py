@@ -24,10 +24,16 @@ from UtilsCMS import *
 from rp_utils import update_ema_teacher
 from mv_refine import multiview_refine_pseudo_labels
 
+# Houston-aligned SH ablation:
+# When USE_CB_RPLS=False, this run tests MVRefine teacher + EW_TMCC
+# + domain loss only. Target contrastive may still be computed for logs,
+# but its effective weight is forced to 0.0 and it does not optimize.
+# Target contrastive participates in the final loss only when USE_CB_RPLS=True,
+# where warmup/rampup protects against early noisy target pseudo labels.
 USE_MVREFINE_V15 = True
 USE_EMA_TEACHER = True
-USE_CB_RPLS = True
-USE_EW_TMCC = False
+USE_CB_RPLS = False
+USE_EW_TMCC = True
 
 MV_WARMUP_EPOCHS = 20
 
@@ -41,13 +47,15 @@ MV_LMMD_BLEND_MAX = 0.3
 RP_EVAL_INTERVAL = 10
 
 RPLS_WARMUP_EPOCHS = MV_WARMUP_EPOCHS
-RPLS_LMMD_BLEND_MAX = 0.1
+RPLS_LMMD_BLEND_MAX = 0.05
 
-LAMBDA_TGT_CON = 0
+LAMBDA_TGT_CON = 1.0
 TGT_CON_RAMPUP_EPOCHS = 60
-LAMBDA_TMCC = 0.01
+USE_RESIDUAL_RPLS_CON = True
+RPLS_CON_ALPHA_MAX = 0.2
+LAMBDA_TMCC = 0.003
 TMCC_TEMPERATURE = 2.5
-TMCC_WARMUP_EPOCHS = 20
+TMCC_WARMUP_EPOCHS = 40
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
@@ -194,6 +202,21 @@ best_G,best_RandPerm,best_Row, best_Column,best_nTrain = None,None,None,None,Non
 
 for iDataSet in range(nDataSet):
     print('#######################idataset######################## ', iDataSet)
+    print(
+        'SH v15 controls: USE_MVREFINE_V15={}, USE_EMA_TEACHER={}, '
+        'USE_CB_RPLS={}, USE_EW_TMCC={}, LAMBDA_TGT_CON={}, '
+        'USE_RESIDUAL_RPLS_CON={}, RPLS_CON_ALPHA_MAX={}, '
+        'RPLS_LMMD_BLEND_MAX={}'.format(
+            USE_MVREFINE_V15,
+            USE_EMA_TEACHER,
+            USE_CB_RPLS,
+            USE_EW_TMCC,
+            LAMBDA_TGT_CON,
+            USE_RESIDUAL_RPLS_CON,
+            RPLS_CON_ALPHA_MAX,
+            RPLS_LMMD_BLEND_MAX
+        )
+    )
     utils.set_seed(seeds[iDataSet])
 
     trainX, trainY = utils.get_sample_data(data_s, label_s, HalfWidth, 180)
@@ -267,6 +290,7 @@ for iDataSet in range(nDataSet):
         num_iter = len_source_loader
         ema_decay = get_ema_decay(epoch) if USE_EMA_TEACHER else 0.0
         target_con_weight = 0.0
+        effective_target_con_weight = 0.0
 
         for i in range(1,num_iter):
             source_data, source_label = next(iter_source)
@@ -405,36 +429,50 @@ for iDataSet in range(nDataSet):
             else:
                 lmmd_loss = lmmd_loss_base
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
-            if USE_CB_RPLS:
-                if epoch > RPLS_WARMUP_EPOCHS:
-                    target_con_progress = min(
-                        1.0,
-                        max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
-                    )
-                    target_con_weight = LAMBDA_TGT_CON * target_con_progress
-                else:
-                    target_con_weight = 0.0
+            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS:
+                target_con_progress = min(
+                    1.0,
+                    max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
+                )
+                target_con_weight = LAMBDA_TGT_CON * target_con_progress
             else:
-                target_con_weight = LAMBDA_TGT_CON
+                target_con_weight = 0.0
+            effective_target_con_weight = target_con_weight
+
             # Loss Con_s
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
-            if USE_CB_RPLS:
-                target_con_num = int(reliable_mask.sum().item()) if epoch > RPLS_WARMUP_EPOCHS else 0
-                if epoch > RPLS_WARMUP_EPOCHS and reliable_mask.sum().item() >= 2:
-                    contrastive_loss_t = ContrastiveLoss_t(
-                        all_target_con_features[reliable_mask],
-                        pseudo_label_t_for_scl[reliable_mask],
-                        sample_weight=sample_weight[reliable_mask]
-                    )
-                else:
-                    contrastive_loss_t = target_features.new_tensor(0.0)
-            else:
-                target_con_num = int(pseudo_label_t_for_scl.numel())
-                contrastive_loss_t = ContrastiveLoss_t(
-                    all_target_con_features,
-                    pseudo_label_t_for_scl
+            base_target_con_num = int(pseudo_label_t_student.numel())
+            target_con_num = int(reliable_mask.sum().item()) if USE_CB_RPLS else base_target_con_num
+            contrastive_loss_t_base = ContrastiveLoss_t(
+                all_target_con_features,
+                pseudo_label_t_student
+            )
+
+            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS and reliable_mask.sum().item() >= 2:
+                contrastive_loss_t_rpls = ContrastiveLoss_t(
+                    all_target_con_features[reliable_mask],
+                    pseudo_label_t_for_scl[reliable_mask],
+                    sample_weight=sample_weight[reliable_mask]
                 )
+                has_valid_rpls_con = True
+            else:
+                contrastive_loss_t_rpls = target_features.new_tensor(0.0)
+                has_valid_rpls_con = False
+
+            if USE_CB_RPLS and USE_RESIDUAL_RPLS_CON and has_valid_rpls_con:
+                rpls_con_progress = min(
+                    1.0,
+                    max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
+                )
+                rpls_con_alpha = RPLS_CON_ALPHA_MAX * rpls_con_progress
+            else:
+                rpls_con_alpha = 0.0
+
+            contrastive_loss_t = (
+                (1.0 - rpls_con_alpha) * contrastive_loss_t_base
+                + rpls_con_alpha * contrastive_loss_t_rpls
+            )
             # Loss Occ
             domain_similar_loss = DSH_loss(source_out, target_out)
 
@@ -465,7 +503,7 @@ for iDataSet in range(nDataSet):
                 cls_loss
                 + 0.01 * lambd * lmmd_loss
                 + contrastive_loss_s
-                + target_con_weight * contrastive_loss_t
+                + effective_target_con_weight * contrastive_loss_t
                 + domain_similar_loss
                 + LAMBDA_TMCC * lambd * tmcc_loss
             )
@@ -488,23 +526,44 @@ for iDataSet in range(nDataSet):
 
             test_accuracy = 100. * float(total_hit) / size
 
-        print('epoch {:>3d}:   cls loss: {:6.4f}, lmmd loss:{:6f}, con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, tmcc loss:{:6f}, lmmd rho:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, reliable weight mean:{:6.4f}, ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted_num:{:>2d}, class cap:{:>2d}, accepted_nonzero:{:>2d}, accepted_top_ratio:{:6.4f}, accepted weight mean:{:6.4f}, candidate num:{:>2d}, candidate ratio:{:6.4f}, per class k:{:>2d}, topk ratio:{:6.4f}, ts agree:{:>2d}, teacher stronger:{:>2d}, rejected disagree:{:>2d}, student_nonzero:{:>2d}, refined_nonzero:{:>2d}, student_top_ratio:{:6.4f}, refined_top_ratio:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student_hist:{}, refined_hist:{}, accepted_hist:{}'
-              .format(epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
-               contrastive_loss_t.item(), domain_similar_loss.item(), tmcc_loss.item(), lmmd_rho,
-               target_con_weight, target_con_num, weight_mean, ema_decay,
-               mv_stats['threshold'], mv_stats['pair_threshold'],
-               mv_stats['triple_num'], mv_stats['pair_num'],
-               mv_stats['reliable_num'], mv_stats['reliable_ratio'], mv_stats['guard_reject'],
-               mv_stats['accepted_num'], mv_stats['class_cap'], mv_stats['accepted_nonzero'],
-               mv_stats['accepted_top_ratio'], mv_stats['accepted_weight_mean'],
-               mv_stats['candidate_num'], mv_stats['candidate_ratio'], mv_stats['per_class_k'],
-               mv_stats['topk_ratio'], mv_stats['teacher_student_agree_num'],
-               mv_stats['teacher_stronger_num'], mv_stats['rejected_disagree_num'],
-               mv_stats['student_nonzero'],
-               mv_stats['refined_nonzero'], mv_stats['student_top_ratio'], mv_stats['refined_top_ratio'],
-               total_hit / size,
-               loss.item(), mv_stats['student_hist'].tolist(), mv_stats['refined_hist'].tolist(),
-               mv_stats['accepted_hist'].tolist()))
+        print(
+            'epoch {:>3d}:   cls loss: {:6.4f}, lmmd loss:{:6f}, con_s loss:{:6f}, '
+            'con_t loss:{:6f}, con_t_base loss:{:6f}, con_t_rpls loss:{:6f}, '
+            'rpls con alpha:{:6.4f}, domain loss:{:6f}, tmcc loss:{:6f}, '
+            'lmmd rho:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, '
+            'effective target con weight:{:6.4f}, base target con num:{:>2d}, '
+            'reliable weight mean:{:6.4f}, '
+            'ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, '
+            'triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, '
+            'reliable ratio:{:6.4f}, guard reject:{}, accepted_num:{:>2d}, '
+            'class cap:{:>2d}, accepted_nonzero:{:>2d}, accepted_top_ratio:{:6.4f}, '
+            'accepted weight mean:{:6.4f}, candidate num:{:>2d}, '
+            'candidate ratio:{:6.4f}, per class k:{:>2d}, topk ratio:{:6.4f}, '
+            'ts agree:{:>2d}, teacher stronger:{:>2d}, rejected disagree:{:>2d}, '
+            'student_nonzero:{:>2d}, refined_nonzero:{:>2d}, '
+            'student_top_ratio:{:6.4f}, refined_top_ratio:{:6.4f}, acc {:6.4f}, '
+            'total loss: {:6.4f}, student_hist:{}, refined_hist:{}, accepted_hist:{}'
+            .format(
+                epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
+                contrastive_loss_t.item(), contrastive_loss_t_base.item(),
+                contrastive_loss_t_rpls.item(), rpls_con_alpha,
+                domain_similar_loss.item(), tmcc_loss.item(), lmmd_rho,
+                target_con_weight, target_con_num, effective_target_con_weight,
+                base_target_con_num, weight_mean, ema_decay,
+                mv_stats['threshold'], mv_stats['pair_threshold'],
+                mv_stats['triple_num'], mv_stats['pair_num'],
+                mv_stats['reliable_num'], mv_stats['reliable_ratio'], mv_stats['guard_reject'],
+                mv_stats['accepted_num'], mv_stats['class_cap'], mv_stats['accepted_nonzero'],
+                mv_stats['accepted_top_ratio'], mv_stats['accepted_weight_mean'],
+                mv_stats['candidate_num'], mv_stats['candidate_ratio'], mv_stats['per_class_k'],
+                mv_stats['topk_ratio'], mv_stats['teacher_student_agree_num'],
+                mv_stats['teacher_stronger_num'], mv_stats['rejected_disagree_num'],
+                mv_stats['student_nonzero'], mv_stats['refined_nonzero'],
+                mv_stats['student_top_ratio'], mv_stats['refined_top_ratio'],
+                total_hit / size, loss.item(), mv_stats['student_hist'].tolist(),
+                mv_stats['refined_hist'].tolist(), mv_stats['accepted_hist'].tolist()
+            )
+        )
 
         train_end = time.time()
         if epoch % RP_EVAL_INTERVAL == 0 or epoch == epochs:

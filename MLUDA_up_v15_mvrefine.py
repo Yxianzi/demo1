@@ -6,6 +6,8 @@
 
 import math
 import copy
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,21 +32,56 @@ USE_CB_RPLS = True
 USE_EW_TMCC = True
 
 MV_WARMUP_EPOCHS = 20
-MV_THRESHOLD_START = 0.80
-MV_THRESHOLD_END = 0.65
+MV_THRESHOLD_START = 0.85
+MV_THRESHOLD_END = 0.70
 MV_PAIR_DELTA = 0.05
 MV_PAIR_WEIGHT = 0.7
 MV_LMMD_BLEND_MAX = 0.3
 RP_EVAL_INTERVAL = 10
 
 RPLS_WARMUP_EPOCHS = MV_WARMUP_EPOCHS
-RPLS_LMMD_BLEND_MAX = 0.5
+RPLS_LMMD_BLEND_MAX = 0.2
 
 LAMBDA_TGT_CON = 1.0
 TGT_CON_RAMPUP_EPOCHS = 20
+USE_RESIDUAL_RPLS_CON = True
+RPLS_CON_ALPHA_MAX = 0.2
+
 LAMBDA_TMCC = 0.01
 TMCC_TEMPERATURE = 2.5
 TMCC_WARMUP_EPOCHS = 20
+
+LATE_DECAY_START = 80
+LATE_DECAY_END = 100
+LATE_LMMD_FACTOR_MIN = 0.25
+LATE_TMCC_FACTOR_MIN = 0.3
+EMA_DECAY_LATE = 0.9992
+
+LOG_DIR = './logs'
+LOG_FILE_PREFIX = 'pavia_up_v15_mvrefine'
+
+class TeeLogger:
+    def __init__(self, console_stream, log_path):
+        self.console_stream = console_stream
+        self.log_file = open(log_path, 'a', encoding='utf-8')
+
+    def write(self, message):
+        self.console_stream.write(message)
+        self.log_file.write(message)
+
+    def flush(self):
+        self.console_stream.flush()
+        self.log_file.flush()
+
+def setup_logger():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    log_path = os.path.join(LOG_DIR, '{}_{}.log'.format(LOG_FILE_PREFIX, timestamp))
+    sys.stdout = TeeLogger(sys.stdout, log_path)
+    print('Log file: {}'.format(log_path))
+    return log_path
+
+LOG_FILE_PATH = setup_logger()
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
@@ -55,7 +92,22 @@ def get_ema_decay(epoch):
         return 0.99
     if epoch <= 50:
         return 0.995
-    return 0.999
+    late_progress = get_late_decay_progress(epoch)
+    return 0.999 + (EMA_DECAY_LATE - 0.999) * late_progress
+
+def get_late_decay_progress(epoch):
+    if epoch <= LATE_DECAY_START:
+        return 0.0
+    return min(
+        1.0,
+        max(0.0, (epoch - LATE_DECAY_START) / max(1, LATE_DECAY_END - LATE_DECAY_START))
+    )
+
+def get_late_decay_factors(epoch):
+    late_progress = get_late_decay_progress(epoch)
+    late_lmmd_factor = 1.0 - (1.0 - LATE_LMMD_FACTOR_MIN) * late_progress
+    late_tmcc_factor = 1.0 - (1.0 - LATE_TMCC_FACTOR_MIN) * late_progress
+    return late_progress, late_lmmd_factor, late_tmcc_factor
 
 def entropy_weighted_mcc_loss(logits, temperature=2.5, sample_weight=None, eps=1e-6):
     prob = F.softmax(logits / temperature, dim=1)
@@ -197,6 +249,30 @@ best_G,best_RandPerm,best_Row, best_Column,best_nTrain = None,None,None,None,Non
 
 for iDataSet in range(nDataSet):
     print('#######################idataset######################## ', iDataSet)
+    print(
+        'Pavia mvrefine controls: USE_MVREFINE_V15={}, USE_EMA_TEACHER={}, '
+        'USE_CB_RPLS={}, USE_EW_TMCC={}, RPLS_LMMD_BLEND_MAX={}, '
+        'LAMBDA_TGT_CON={}, USE_RESIDUAL_RPLS_CON={}, RPLS_CON_ALPHA_MAX={}, '
+        'LAMBDA_TMCC={}, LATE_DECAY_START={}, LATE_DECAY_END={}, '
+        'LATE_LMMD_FACTOR_MIN={}, LATE_TMCC_FACTOR_MIN={}, EMA_DECAY_LATE={}, '
+        'LOG_FILE_PATH={}'.format(
+            USE_MVREFINE_V15,
+            USE_EMA_TEACHER,
+            USE_CB_RPLS,
+            USE_EW_TMCC,
+            RPLS_LMMD_BLEND_MAX,
+            LAMBDA_TGT_CON,
+            USE_RESIDUAL_RPLS_CON,
+            RPLS_CON_ALPHA_MAX,
+            LAMBDA_TMCC,
+            LATE_DECAY_START,
+            LATE_DECAY_END,
+            LATE_LMMD_FACTOR_MIN,
+            LATE_TMCC_FACTOR_MIN,
+            EMA_DECAY_LATE,
+            LOG_FILE_PATH
+        )
+    )
     utils.set_seed(seeds[iDataSet])
 
     trainX, trainY = utils.get_sample_data(data_s, label_s, HalfWidth, 180)
@@ -403,41 +479,49 @@ for iDataSet in range(nDataSet):
                     1.0,
                     max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, epochs - RPLS_WARMUP_EPOCHS))
                 )
-                lmmd_rho = RPLS_LMMD_BLEND_MAX * rpls_progress
+                late_progress, late_lmmd_factor, late_tmcc_factor = get_late_decay_factors(epoch)
+                lmmd_rho = RPLS_LMMD_BLEND_MAX * rpls_progress * late_lmmd_factor
                 lmmd_loss = (1.0 - lmmd_rho) * lmmd_loss_base + lmmd_rho * lmmd_loss_reliable
             else:
+                late_progress, late_lmmd_factor, late_tmcc_factor = get_late_decay_factors(epoch)
                 lmmd_loss = lmmd_loss_base
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
-            if USE_CB_RPLS:
-                if epoch > RPLS_WARMUP_EPOCHS:
-                    target_con_progress = min(
-                        1.0,
-                        max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
-                    )
-                    target_con_weight = LAMBDA_TGT_CON * target_con_progress
-                else:
-                    target_con_weight = 0.0
-            else:
-                target_con_weight = LAMBDA_TGT_CON
+            tmcc_weight = LAMBDA_TMCC * late_tmcc_factor
+            target_con_weight = LAMBDA_TGT_CON
             # Loss Con_s
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
-            if USE_CB_RPLS:
-                target_con_num = int(reliable_mask.sum().item()) if epoch > RPLS_WARMUP_EPOCHS else 0
-                if epoch > RPLS_WARMUP_EPOCHS and reliable_mask.sum().item() >= 2:
-                    contrastive_loss_t = ContrastiveLoss_t(
-                        all_target_con_features[reliable_mask],
-                        pseudo_label_t_for_scl[reliable_mask],
-                        sample_weight=sample_weight[reliable_mask]
-                    )
-                else:
-                    contrastive_loss_t = target_features.new_tensor(0.0)
-            else:
-                target_con_num = int(pseudo_label_t_for_scl.numel())
-                contrastive_loss_t = ContrastiveLoss_t(
-                    all_target_con_features,
-                    pseudo_label_t_for_scl
+            base_target_con_num = int(pseudo_label_t_student.numel())
+            target_con_num = int(reliable_mask.sum().item()) if USE_CB_RPLS else base_target_con_num
+            contrastive_loss_t_base = ContrastiveLoss_t(
+                all_target_con_features,
+                pseudo_label_t_student
+            )
+
+            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS and reliable_mask.sum().item() >= 2:
+                contrastive_loss_t_rpls = ContrastiveLoss_t(
+                    all_target_con_features[reliable_mask],
+                    pseudo_label_t_for_scl[reliable_mask],
+                    sample_weight=sample_weight[reliable_mask]
                 )
+                has_valid_rpls_con = True
+            else:
+                contrastive_loss_t_rpls = target_features.new_tensor(0.0)
+                has_valid_rpls_con = False
+
+            if USE_CB_RPLS and USE_RESIDUAL_RPLS_CON and has_valid_rpls_con:
+                rpls_con_progress = min(
+                    1.0,
+                    max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
+                )
+                rpls_con_alpha = RPLS_CON_ALPHA_MAX * rpls_con_progress
+            else:
+                rpls_con_alpha = 0.0
+
+            contrastive_loss_t = (
+                (1.0 - rpls_con_alpha) * contrastive_loss_t_base
+                + rpls_con_alpha * contrastive_loss_t_rpls
+            )
             # Loss Occ
             domain_similar_loss = DSH_loss(source_out, target_out)
 
@@ -470,7 +554,7 @@ for iDataSet in range(nDataSet):
                 + contrastive_loss_s
                 + target_con_weight * contrastive_loss_t
                 + domain_similar_loss
-                + LAMBDA_TMCC * lambd * tmcc_loss
+                + tmcc_weight * lambd * tmcc_loss
             )
 
             loss = loss_base
@@ -491,23 +575,45 @@ for iDataSet in range(nDataSet):
 
             test_accuracy = 100. * float(total_hit) / size
 
-        print('epoch {:>3d}:   cls loss: {:6.4f}, lmmd loss:{:6f}, con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, tmcc loss:{:6f}, lmmd rho:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, reliable weight mean:{:6.4f}, ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted_num:{:>2d}, class cap:{:>2d}, accepted_nonzero:{:>2d}, accepted_top_ratio:{:6.4f}, accepted weight mean:{:6.4f}, candidate num:{:>2d}, candidate ratio:{:6.4f}, per class k:{:>2d}, topk ratio:{:6.4f}, ts agree:{:>2d}, teacher stronger:{:>2d}, rejected disagree:{:>2d}, student_nonzero:{:>2d}, refined_nonzero:{:>2d}, student_top_ratio:{:6.4f}, refined_top_ratio:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student_hist:{}, refined_hist:{}, accepted_hist:{}'
-              .format(epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
-               contrastive_loss_t.item(), domain_similar_loss.item(), tmcc_loss.item(), lmmd_rho,
-               target_con_weight, target_con_num, weight_mean, ema_decay,
-               mv_stats['threshold'], mv_stats['pair_threshold'],
-               mv_stats['triple_num'], mv_stats['pair_num'],
-               mv_stats['reliable_num'], mv_stats['reliable_ratio'], mv_stats['guard_reject'],
-               mv_stats['accepted_num'], mv_stats['class_cap'], mv_stats['accepted_nonzero'],
-               mv_stats['accepted_top_ratio'], mv_stats['accepted_weight_mean'],
-               mv_stats['candidate_num'], mv_stats['candidate_ratio'], mv_stats['per_class_k'],
-               mv_stats['topk_ratio'], mv_stats['teacher_student_agree_num'],
-               mv_stats['teacher_stronger_num'], mv_stats['rejected_disagree_num'],
-               mv_stats['student_nonzero'],
-               mv_stats['refined_nonzero'], mv_stats['student_top_ratio'], mv_stats['refined_top_ratio'],
-               total_hit / size,
-               loss.item(), mv_stats['student_hist'].tolist(), mv_stats['refined_hist'].tolist(),
-               mv_stats['accepted_hist'].tolist()))
+        print(
+            'epoch {:>3d}:   cls loss: {:6.4f}, lmmd loss:{:6f}, con_s loss:{:6f}, '
+            'con_t loss:{:6f}, con_t_base loss:{:6f}, con_t_rpls loss:{:6f}, '
+            'rpls con alpha:{:6.4f}, domain loss:{:6f}, tmcc loss:{:6f}, '
+            'tmcc weight:{:6.4f}, lmmd rho:{:6.4f}, late progress:{:6.4f}, '
+            'late lmmd factor:{:6.4f}, late tmcc factor:{:6.4f}, '
+            'target con weight:{:6.4f}, target con num:{:>2d}, '
+            'base target con num:{:>2d}, reliable weight mean:{:6.4f}, '
+            'ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, '
+            'triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, '
+            'reliable ratio:{:6.4f}, guard reject:{}, accepted_num:{:>2d}, '
+            'class cap:{:>2d}, accepted_nonzero:{:>2d}, accepted_top_ratio:{:6.4f}, '
+            'accepted weight mean:{:6.4f}, candidate num:{:>2d}, '
+            'candidate ratio:{:6.4f}, per class k:{:>2d}, topk ratio:{:6.4f}, '
+            'ts agree:{:>2d}, teacher stronger:{:>2d}, rejected disagree:{:>2d}, '
+            'student_nonzero:{:>2d}, refined_nonzero:{:>2d}, '
+            'student_top_ratio:{:6.4f}, refined_top_ratio:{:6.4f}, acc {:6.4f}, '
+            'total loss: {:6.4f}, student_hist:{}, refined_hist:{}, accepted_hist:{}'
+            .format(
+                epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
+                contrastive_loss_t.item(), contrastive_loss_t_base.item(),
+                contrastive_loss_t_rpls.item(), rpls_con_alpha,
+                domain_similar_loss.item(), tmcc_loss.item(), tmcc_weight, lmmd_rho,
+                late_progress, late_lmmd_factor, late_tmcc_factor, target_con_weight,
+                target_con_num, base_target_con_num, weight_mean, ema_decay,
+                mv_stats['threshold'], mv_stats['pair_threshold'],
+                mv_stats['triple_num'], mv_stats['pair_num'],
+                mv_stats['reliable_num'], mv_stats['reliable_ratio'], mv_stats['guard_reject'],
+                mv_stats['accepted_num'], mv_stats['class_cap'], mv_stats['accepted_nonzero'],
+                mv_stats['accepted_top_ratio'], mv_stats['accepted_weight_mean'],
+                mv_stats['candidate_num'], mv_stats['candidate_ratio'], mv_stats['per_class_k'],
+                mv_stats['topk_ratio'], mv_stats['teacher_student_agree_num'],
+                mv_stats['teacher_stronger_num'], mv_stats['rejected_disagree_num'],
+                mv_stats['student_nonzero'], mv_stats['refined_nonzero'],
+                mv_stats['student_top_ratio'], mv_stats['refined_top_ratio'],
+                total_hit / size, loss.item(), mv_stats['student_hist'].tolist(),
+                mv_stats['refined_hist'].tolist(), mv_stats['accepted_hist'].tolist()
+            )
+        )
 
         train_end = time.time()
         if epoch % RP_EVAL_INTERVAL == 0 or epoch == epochs:

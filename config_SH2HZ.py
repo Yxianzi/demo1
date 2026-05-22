@@ -5,7 +5,7 @@ epochs = 100
 lr = 0.0003
 CLASS_NUM = 3
 nBand = 198
-HalfWidth =  0
+HalfWidth = 1
 train_num = 40
 
 pca_n = 2

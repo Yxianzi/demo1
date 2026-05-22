@@ -26,7 +26,7 @@ from mv_refine import multiview_refine_pseudo_labels
 
 USE_MVREFINE_V15 = True
 USE_EMA_TEACHER = True
-USE_CB_RPLS = False
+USE_CB_RPLS = True
 USE_EW_TMCC = True
 
 MV_WARMUP_EPOCHS = 20
