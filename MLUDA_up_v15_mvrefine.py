@@ -29,11 +29,13 @@ from mv_refine import multiview_refine_pseudo_labels
 USE_MVREFINE_V15 = True
 USE_EMA_TEACHER = True
 USE_CB_RPLS = True
-USE_EW_TMCC = True
+USE_EW_TMCC = False
 
 MV_WARMUP_EPOCHS = 20
+
 MV_THRESHOLD_START = 0.85
 MV_THRESHOLD_END = 0.70
+
 MV_PAIR_DELTA = 0.05
 MV_PAIR_WEIGHT = 0.7
 MV_LMMD_BLEND_MAX = 0.3
@@ -44,8 +46,25 @@ RPLS_LMMD_BLEND_MAX = 0.2
 
 LAMBDA_TGT_CON = 1.0
 TGT_CON_RAMPUP_EPOCHS = 20
+TGT_CON_WEIGHT_START = 0.5
+TGT_CON_WEIGHT_RAMPUP_EPOCHS = 30
 USE_RESIDUAL_RPLS_CON = True
 RPLS_CON_ALPHA_MAX = 0.2
+USE_RPLS_SOFT_COVERAGE = True
+USE_RPLS_CLASS_RESCUE = True
+USE_CLASS_ADAPTIVE_RPLS_THRESHOLD = True
+RPLS_MIN_RELIABLE_PER_CLASS = 2
+RPLS_CLASS_THRESHOLD_FLOOR = 0.55
+RPLS_CLASS_THRESHOLD_RELAX = 0.08
+RPLS_RESCUE_CONF_MIN = 0.60
+RPLS_RESCUE_WEIGHT_SCALE = 0.5
+USE_RPLS_CROSS_CLASS_RESCUE = True
+RPLS_CROSS_RESCUE_MARGIN_MAX = 0.15
+RPLS_CROSS_RESCUE_WEIGHT_SCALE = 0.35
+USE_RPLS_CLASS_BALANCE = True
+RPLS_BALANCE_POWER = 0.5
+RPLS_BALANCE_WEIGHT_MIN = 0.5
+RPLS_BALANCE_WEIGHT_MAX = 2.0
 
 LAMBDA_TMCC = 0.01
 TMCC_TEMPERATURE = 2.5
@@ -108,6 +127,155 @@ def get_late_decay_factors(epoch):
     late_lmmd_factor = 1.0 - (1.0 - LATE_LMMD_FACTOR_MIN) * late_progress
     late_tmcc_factor = 1.0 - (1.0 - LATE_TMCC_FACTOR_MIN) * late_progress
     return late_progress, late_lmmd_factor, late_tmcc_factor
+
+def get_target_con_weight(epoch):
+    ramp_progress = min(
+        1.0,
+        max(0.0, epoch / max(1, TGT_CON_WEIGHT_RAMPUP_EPOCHS))
+    )
+    return LAMBDA_TGT_CON * (
+        TGT_CON_WEIGHT_START + (1.0 - TGT_CON_WEIGHT_START) * ramp_progress
+    )
+
+def get_rpls_coverage_factor(labels, reliable_mask):
+    if not USE_RPLS_SOFT_COVERAGE:
+        return 1.0
+    if reliable_mask.sum().item() == 0:
+        return 0.0
+    reliable_labels = labels[reliable_mask].detach()
+    counts = torch.bincount(reliable_labels, minlength=CLASS_NUM)
+    accepted_nonzero = int((counts > 0).sum().item())
+    return min(1.0, max(0.0, accepted_nonzero / float(max(1, CLASS_NUM))))
+
+def get_class_rescue_threshold(selected_num):
+    if not USE_CLASS_ADAPTIVE_RPLS_THRESHOLD:
+        return RPLS_RESCUE_CONF_MIN
+    shortfall_ratio = min(
+        1.0,
+        max(
+            0.0,
+            (RPLS_MIN_RELIABLE_PER_CLASS - selected_num)
+            / float(max(1, RPLS_MIN_RELIABLE_PER_CLASS))
+        )
+    )
+    return max(
+        RPLS_CLASS_THRESHOLD_FLOOR,
+        RPLS_RESCUE_CONF_MIN - RPLS_CLASS_THRESHOLD_RELAX * shortfall_ratio
+    )
+
+def get_empty_rpls_rescue_stats():
+    return {
+        "rpls_rescue_num": 0,
+        "rpls_cross_rescue_num": 0,
+    }
+
+def build_balanced_reliable_selection(reliable_mask, sample_weight, labels, class_prob):
+    labels = labels.detach().view(-1)
+    class_prob = class_prob.detach()
+    balanced_labels = labels.clone()
+    rescue_stats = get_empty_rpls_rescue_stats()
+    if not USE_RPLS_CLASS_RESCUE:
+        return reliable_mask, sample_weight, balanced_labels, rescue_stats
+
+    balanced_mask = reliable_mask.clone()
+    balanced_weight = sample_weight.clone()
+    rescue_num = 0
+    cross_rescue_num = 0
+
+    if reliable_mask.sum().item() > 0:
+        default_weight = sample_weight[reliable_mask].mean().detach() * RPLS_RESCUE_WEIGHT_SCALE
+        cross_default_weight = sample_weight[reliable_mask].mean().detach() * RPLS_CROSS_RESCUE_WEIGHT_SCALE
+    else:
+        default_weight = sample_weight.new_tensor(RPLS_RESCUE_WEIGHT_SCALE)
+        cross_default_weight = sample_weight.new_tensor(RPLS_CROSS_RESCUE_WEIGHT_SCALE)
+
+    top_conf, _ = class_prob.max(dim=1)
+
+    for class_id in range(CLASS_NUM):
+        class_label_mask = balanced_labels == class_id
+        selected_num = int((balanced_mask & class_label_mask).sum().item())
+        need_num = RPLS_MIN_RELIABLE_PER_CLASS - selected_num
+        if need_num <= 0:
+            continue
+
+        class_score = class_prob[:, class_id]
+        rescue_threshold = get_class_rescue_threshold(selected_num)
+        candidate_mask = (~balanced_mask) & class_label_mask
+        candidate_mask = candidate_mask & (class_score >= rescue_threshold)
+        candidate_num = int(candidate_mask.sum().item())
+        if candidate_num > 0:
+            candidate_index = torch.nonzero(candidate_mask, as_tuple=False).view(-1)
+            top_num = min(need_num, candidate_num)
+            _, top_order = torch.topk(class_score[candidate_index], top_num)
+            selected_index = candidate_index[top_order]
+            balanced_mask[selected_index] = True
+            balanced_weight[selected_index] = torch.maximum(
+                balanced_weight[selected_index],
+                default_weight.expand_as(balanced_weight[selected_index])
+            )
+            rescue_num += int(top_num)
+            need_num -= int(top_num)
+
+        if (not USE_RPLS_CROSS_CLASS_RESCUE) or need_num <= 0:
+            continue
+
+        # If a class disappears from argmax pseudo labels, keep a tiny low-weight
+        # bridge from ambiguous samples whose class score is close to top-1.
+        cross_threshold = max(RPLS_CLASS_THRESHOLD_FLOOR, rescue_threshold)
+        candidate_mask = (~balanced_mask) & (class_score >= cross_threshold)
+        candidate_mask = candidate_mask & (class_score >= top_conf - RPLS_CROSS_RESCUE_MARGIN_MAX)
+        if candidate_mask.sum().item() == 0:
+            continue
+
+        candidate_num = int(candidate_mask.sum().item())
+        if candidate_num == 0:
+            continue
+
+        candidate_index = torch.nonzero(candidate_mask, as_tuple=False).view(-1)
+        top_num = min(need_num, candidate_num)
+        _, top_order = torch.topk(class_score[candidate_index], top_num)
+        selected_index = candidate_index[top_order]
+        balanced_mask[selected_index] = True
+        balanced_labels[selected_index] = class_id
+        balanced_weight[selected_index] = torch.maximum(
+            balanced_weight[selected_index],
+            cross_default_weight.expand_as(balanced_weight[selected_index])
+        )
+        cross_rescue_num += int(top_num)
+
+    rescue_stats.update({
+        "rpls_rescue_num": int(rescue_num + cross_rescue_num),
+        "rpls_cross_rescue_num": int(cross_rescue_num),
+    })
+    return balanced_mask, balanced_weight, balanced_labels, rescue_stats
+
+def get_balanced_rpls_weight(sample_weight, labels, reliable_mask):
+    if (not USE_RPLS_CLASS_BALANCE) or reliable_mask.sum().item() == 0:
+        return sample_weight, 1.0, 1.0
+
+    balanced_weight = sample_weight.clone()
+    reliable_labels = labels[reliable_mask].detach()
+    counts = torch.bincount(reliable_labels, minlength=CLASS_NUM).to(
+        device=sample_weight.device,
+        dtype=sample_weight.dtype
+    )
+    present = counts > 0
+    if not torch.any(present):
+        return sample_weight, 1.0, 1.0
+
+    mean_count = counts[present].mean()
+    class_factor = torch.ones(CLASS_NUM, device=sample_weight.device, dtype=sample_weight.dtype)
+    class_factor[present] = (mean_count / counts[present].clamp_min(1.0)).pow(RPLS_BALANCE_POWER)
+    class_factor = class_factor.clamp(RPLS_BALANCE_WEIGHT_MIN, RPLS_BALANCE_WEIGHT_MAX)
+
+    reliable_factor = class_factor[reliable_labels]
+    reliable_factor = reliable_factor / reliable_factor.mean().clamp_min(1e-6)
+    balanced_weight[reliable_mask] = balanced_weight[reliable_mask] * reliable_factor
+    return (
+        balanced_weight,
+        float(reliable_factor.min().item()),
+        float(reliable_factor.max().item())
+    )
 
 def entropy_weighted_mcc_loss(logits, temperature=2.5, sample_weight=None, eps=1e-6):
     prob = F.softmax(logits / temperature, dim=1)
@@ -253,6 +421,14 @@ for iDataSet in range(nDataSet):
         'Pavia mvrefine controls: USE_MVREFINE_V15={}, USE_EMA_TEACHER={}, '
         'USE_CB_RPLS={}, USE_EW_TMCC={}, RPLS_LMMD_BLEND_MAX={}, '
         'LAMBDA_TGT_CON={}, USE_RESIDUAL_RPLS_CON={}, RPLS_CON_ALPHA_MAX={}, '
+        'TGT_CON_WEIGHT_START={}, TGT_CON_WEIGHT_RAMPUP_EPOCHS={}, '
+        'USE_RPLS_SOFT_COVERAGE={}, USE_RPLS_CLASS_RESCUE={}, '
+        'USE_CLASS_ADAPTIVE_RPLS_THRESHOLD={}, RPLS_MIN_RELIABLE_PER_CLASS={}, '
+        'RPLS_CLASS_THRESHOLD_FLOOR={}, RPLS_CLASS_THRESHOLD_RELAX={}, '
+        'RPLS_RESCUE_CONF_MIN={}, RPLS_RESCUE_WEIGHT_SCALE={}, '
+        'USE_RPLS_CROSS_CLASS_RESCUE={}, RPLS_CROSS_RESCUE_MARGIN_MAX={}, '
+        'RPLS_CROSS_RESCUE_WEIGHT_SCALE={}, USE_RPLS_CLASS_BALANCE={}, '
+        'RPLS_BALANCE_POWER={}, RPLS_BALANCE_WEIGHT_MIN={}, RPLS_BALANCE_WEIGHT_MAX={}, '
         'LAMBDA_TMCC={}, LATE_DECAY_START={}, LATE_DECAY_END={}, '
         'LATE_LMMD_FACTOR_MIN={}, LATE_TMCC_FACTOR_MIN={}, EMA_DECAY_LATE={}, '
         'LOG_FILE_PATH={}'.format(
@@ -264,6 +440,23 @@ for iDataSet in range(nDataSet):
             LAMBDA_TGT_CON,
             USE_RESIDUAL_RPLS_CON,
             RPLS_CON_ALPHA_MAX,
+            TGT_CON_WEIGHT_START,
+            TGT_CON_WEIGHT_RAMPUP_EPOCHS,
+            USE_RPLS_SOFT_COVERAGE,
+            USE_RPLS_CLASS_RESCUE,
+            USE_CLASS_ADAPTIVE_RPLS_THRESHOLD,
+            RPLS_MIN_RELIABLE_PER_CLASS,
+            RPLS_CLASS_THRESHOLD_FLOOR,
+            RPLS_CLASS_THRESHOLD_RELAX,
+            RPLS_RESCUE_CONF_MIN,
+            RPLS_RESCUE_WEIGHT_SCALE,
+            USE_RPLS_CROSS_CLASS_RESCUE,
+            RPLS_CROSS_RESCUE_MARGIN_MAX,
+            RPLS_CROSS_RESCUE_WEIGHT_SCALE,
+            USE_RPLS_CLASS_BALANCE,
+            RPLS_BALANCE_POWER,
+            RPLS_BALANCE_WEIGHT_MIN,
+            RPLS_BALANCE_WEIGHT_MAX,
             LAMBDA_TMCC,
             LATE_DECAY_START,
             LATE_DECAY_END,
@@ -327,7 +520,7 @@ for iDataSet in range(nDataSet):
     loss3 = []
 
     for epoch in range(1, epochs + 1):
-        LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
+        LEARNING_RATE = lr #/ math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
         print('learning rate{: .4f}'.format(LEARNING_RATE))
         optimizer = torch.optim.SGD([
             {'params': feature_encoder.feature_layers.parameters(),},
@@ -449,6 +642,27 @@ for iDataSet in range(nDataSet):
             # Loss Cls
             cls_loss = crossEntropy(source_outputs, source_label_cuda)
             # Loss Lmmd
+            (
+                balanced_reliable_mask,
+                rescued_sample_weight,
+                balanced_rpls_label,
+                rpls_rescue_stats,
+            ) = build_balanced_reliable_selection(
+                reliable_mask,
+                sample_weight,
+                pseudo_label_t_for_scl,
+                refined_prob
+            )
+            rpls_rescue_num = rpls_rescue_stats["rpls_rescue_num"]
+            rpls_coverage_factor = get_rpls_coverage_factor(
+                balanced_rpls_label,
+                balanced_reliable_mask
+            )
+            balanced_sample_weight, rpls_balance_min, rpls_balance_max = get_balanced_rpls_weight(
+                rescued_sample_weight,
+                balanced_rpls_label,
+                balanced_reliable_mask
+            )
             lmmd_loss_base = mmd.lmmd(
                 source_features,
                 target_features,
@@ -460,15 +674,15 @@ for iDataSet in range(nDataSet):
             if (
                 USE_CB_RPLS
                 and epoch > RPLS_WARMUP_EPOCHS
-                and reliable_mask.sum().item() > 0
-                and sample_weight.detach().sum().item() > 0
+                and balanced_reliable_mask.sum().item() > 0
+                and balanced_sample_weight.detach().sum().item() > 0
             ):
                 lmmd_loss_reliable = mmd.weighted_lmmd(
                     source_features,
                     target_features,
                     source_label,
                     refined_prob.detach(),
-                    t_weight=sample_weight.detach(),
+                    t_weight=balanced_sample_weight.detach(),
                     BATCH_SIZE=BATCH_SIZE,
                     CLASS_NUM=CLASS_NUM
                 )
@@ -480,29 +694,34 @@ for iDataSet in range(nDataSet):
                     max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, epochs - RPLS_WARMUP_EPOCHS))
                 )
                 late_progress, late_lmmd_factor, late_tmcc_factor = get_late_decay_factors(epoch)
-                lmmd_rho = RPLS_LMMD_BLEND_MAX * rpls_progress * late_lmmd_factor
+                lmmd_rho = (
+                    RPLS_LMMD_BLEND_MAX
+                    * rpls_progress
+                    * late_lmmd_factor
+                    * rpls_coverage_factor
+                )
                 lmmd_loss = (1.0 - lmmd_rho) * lmmd_loss_base + lmmd_rho * lmmd_loss_reliable
             else:
                 late_progress, late_lmmd_factor, late_tmcc_factor = get_late_decay_factors(epoch)
                 lmmd_loss = lmmd_loss_base
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
             tmcc_weight = LAMBDA_TMCC * late_tmcc_factor
-            target_con_weight = LAMBDA_TGT_CON
+            target_con_weight = get_target_con_weight(epoch)
             # Loss Con_s
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
             base_target_con_num = int(pseudo_label_t_student.numel())
-            target_con_num = int(reliable_mask.sum().item()) if USE_CB_RPLS else base_target_con_num
+            target_con_num = int(balanced_reliable_mask.sum().item()) if USE_CB_RPLS else base_target_con_num
             contrastive_loss_t_base = ContrastiveLoss_t(
                 all_target_con_features,
                 pseudo_label_t_student
             )
 
-            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS and reliable_mask.sum().item() >= 2:
+            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS and balanced_reliable_mask.sum().item() >= 2:
                 contrastive_loss_t_rpls = ContrastiveLoss_t(
-                    all_target_con_features[reliable_mask],
-                    pseudo_label_t_for_scl[reliable_mask],
-                    sample_weight=sample_weight[reliable_mask]
+                    all_target_con_features[balanced_reliable_mask],
+                    balanced_rpls_label[balanced_reliable_mask],
+                    sample_weight=balanced_sample_weight[balanced_reliable_mask]
                 )
                 has_valid_rpls_con = True
             else:
@@ -514,7 +733,7 @@ for iDataSet in range(nDataSet):
                     1.0,
                     max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
                 )
-                rpls_con_alpha = RPLS_CON_ALPHA_MAX * rpls_con_progress
+                rpls_con_alpha = RPLS_CON_ALPHA_MAX * rpls_con_progress * rpls_coverage_factor
             else:
                 rpls_con_alpha = 0.0
 
@@ -526,11 +745,11 @@ for iDataSet in range(nDataSet):
             domain_similar_loss = DSH_loss(source_out, target_out)
 
             if USE_EW_TMCC and epoch > TMCC_WARMUP_EPOCHS:
-                if USE_CB_RPLS and reliable_mask.sum().item() > 0:
+                if USE_CB_RPLS and balanced_reliable_mask.sum().item() > 0:
                     tmcc_loss = entropy_weighted_mcc_loss(
                         target_outputs,
                         temperature=TMCC_TEMPERATURE,
-                        sample_weight=sample_weight
+                        sample_weight=balanced_sample_weight
                     )
                 else:
                     tmcc_loss = entropy_weighted_mcc_loss(
@@ -547,13 +766,17 @@ for iDataSet in range(nDataSet):
                 weight_mean = float(sample_weight[reliable_mask].mean().item())
             else:
                 weight_mean = 0.0
+            if balanced_reliable_mask.sum().item() > 0:
+                balanced_weight_mean = float(balanced_sample_weight[balanced_reliable_mask].mean().item())
+            else:
+                balanced_weight_mean = 0.0
 
             loss_base = (
                 cls_loss
-                + 0.01 * lambd * lmmd_loss
+                + 0.3 * lambd * lmmd_loss
                 + contrastive_loss_s
                 + target_con_weight * contrastive_loss_t
-                + domain_similar_loss
+              # + domain_similar_loss
                 + tmcc_weight * lambd * tmcc_loss
             )
 
@@ -581,8 +804,12 @@ for iDataSet in range(nDataSet):
             'rpls con alpha:{:6.4f}, domain loss:{:6f}, tmcc loss:{:6f}, '
             'tmcc weight:{:6.4f}, lmmd rho:{:6.4f}, late progress:{:6.4f}, '
             'late lmmd factor:{:6.4f}, late tmcc factor:{:6.4f}, '
+            'rpls coverage factor:{:6.4f}, rpls balance min:{:6.4f}, '
+            'rpls balance max:{:6.4f}, rpls rescue num:{:>2d}, '
+            'rpls cross rescue num:{:>2d}, '
             'target con weight:{:6.4f}, target con num:{:>2d}, '
             'base target con num:{:>2d}, reliable weight mean:{:6.4f}, '
+            'balanced weight mean:{:6.4f}, '
             'ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, '
             'triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, '
             'reliable ratio:{:6.4f}, guard reject:{}, accepted_num:{:>2d}, '
@@ -598,8 +825,11 @@ for iDataSet in range(nDataSet):
                 contrastive_loss_t.item(), contrastive_loss_t_base.item(),
                 contrastive_loss_t_rpls.item(), rpls_con_alpha,
                 domain_similar_loss.item(), tmcc_loss.item(), tmcc_weight, lmmd_rho,
-                late_progress, late_lmmd_factor, late_tmcc_factor, target_con_weight,
-                target_con_num, base_target_con_num, weight_mean, ema_decay,
+                late_progress, late_lmmd_factor, late_tmcc_factor, rpls_coverage_factor,
+                rpls_balance_min, rpls_balance_max, rpls_rescue_num,
+                rpls_rescue_stats['rpls_cross_rescue_num'],
+                target_con_weight, target_con_num,
+                base_target_con_num, weight_mean, balanced_weight_mean, ema_decay,
                 mv_stats['threshold'], mv_stats['pair_threshold'],
                 mv_stats['triple_num'], mv_stats['pair_num'],
                 mv_stats['reliable_num'], mv_stats['reliable_ratio'], mv_stats['guard_reject'],

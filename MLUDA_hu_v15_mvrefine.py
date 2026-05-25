@@ -35,7 +35,6 @@ MV_THRESHOLD_END = 0.65
 MV_PAIR_DELTA = 0.05
 MV_PAIR_WEIGHT = 0.7
 MV_LMMD_BLEND_MAX = 0.3
-RP_EVAL_INTERVAL = 10
 
 RPLS_WARMUP_EPOCHS = MV_WARMUP_EPOCHS
 RPLS_LMMD_BLEND_MAX = 0.5
@@ -504,7 +503,7 @@ for iDataSet in range(nDataSet):
                mv_stats['accepted_hist'].tolist()))
 
         train_end = time.time()
-        if epoch % RP_EVAL_INTERVAL == 0 or epoch == epochs:
+        if epoch == epochs:
             print('Testing epoch {} ...'.format(epoch))
             student_result = evaluate_target_domain(feature_encoder, test_loader, source_data)
             student_acc[iDataSet] = student_result['oa']

@@ -32,10 +32,10 @@ from mv_refine import multiview_refine_pseudo_labels
 # where warmup/rampup protects against early noisy target pseudo labels.
 USE_MVREFINE_V15 = True
 USE_EMA_TEACHER = True
-USE_CB_RPLS = False
-USE_EW_TMCC = True
+USE_CB_RPLS = True
+USE_EW_TMCC = False
 
-MV_WARMUP_EPOCHS = 20
+MV_WARMUP_EPOCHS = 40
 
 MV_THRESHOLD_START = 0.80
 MV_THRESHOLD_END = 0.65
@@ -47,15 +47,19 @@ MV_LMMD_BLEND_MAX = 0.3
 RP_EVAL_INTERVAL = 10
 
 RPLS_WARMUP_EPOCHS = MV_WARMUP_EPOCHS
-RPLS_LMMD_BLEND_MAX = 0.05
+RPLS_LMMD_BLEND_MAX = 0.01
 
-LAMBDA_TGT_CON = 1.0
-TGT_CON_RAMPUP_EPOCHS = 60
+LAMBDA_TGT_CON = 0.3
+TGT_CON_RAMPUP_EPOCHS = 80
 USE_RESIDUAL_RPLS_CON = True
-RPLS_CON_ALPHA_MAX = 0.2
+RPLS_CON_ALPHA_MAX = 0.05
 LAMBDA_TMCC = 0.003
 TMCC_TEMPERATURE = 2.5
 TMCC_WARMUP_EPOCHS = 40
+
+SOURCE_CON_DECAY_START = 20
+SOURCE_CON_DECAY_END = 60
+SOURCE_CON_FACTOR_MIN = 0.3
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
@@ -67,6 +71,19 @@ def get_ema_decay(epoch):
     if epoch <= 50:
         return 0.995
     return 0.999
+
+def get_source_con_factor(epoch):
+    if epoch <= SOURCE_CON_DECAY_START:
+        return 1.0
+    progress = min(
+        1.0,
+        max(
+            0.0,
+            (epoch - SOURCE_CON_DECAY_START)
+            / max(1, SOURCE_CON_DECAY_END - SOURCE_CON_DECAY_START)
+        )
+    )
+    return 1.0 - (1.0 - SOURCE_CON_FACTOR_MIN) * progress
 
 def entropy_weighted_mcc_loss(logits, temperature=2.5, sample_weight=None, eps=1e-6):
     prob = F.softmax(logits / temperature, dim=1)
@@ -206,7 +223,8 @@ for iDataSet in range(nDataSet):
         'SH v15 controls: USE_MVREFINE_V15={}, USE_EMA_TEACHER={}, '
         'USE_CB_RPLS={}, USE_EW_TMCC={}, LAMBDA_TGT_CON={}, '
         'USE_RESIDUAL_RPLS_CON={}, RPLS_CON_ALPHA_MAX={}, '
-        'RPLS_LMMD_BLEND_MAX={}'.format(
+        'RPLS_LMMD_BLEND_MAX={}, SOURCE_CON_DECAY_START={}, '
+        'SOURCE_CON_DECAY_END={}, SOURCE_CON_FACTOR_MIN={}'.format(
             USE_MVREFINE_V15,
             USE_EMA_TEACHER,
             USE_CB_RPLS,
@@ -214,7 +232,10 @@ for iDataSet in range(nDataSet):
             LAMBDA_TGT_CON,
             USE_RESIDUAL_RPLS_CON,
             RPLS_CON_ALPHA_MAX,
-            RPLS_LMMD_BLEND_MAX
+            RPLS_LMMD_BLEND_MAX,
+            SOURCE_CON_DECAY_START,
+            SOURCE_CON_DECAY_END,
+            SOURCE_CON_FACTOR_MIN
         )
     )
     utils.set_seed(seeds[iDataSet])
@@ -271,7 +292,7 @@ for iDataSet in range(nDataSet):
     loss3 = []
 
     for epoch in range(1, epochs + 1):
-        LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
+        LEARNING_RATE = lr #/ math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
         print('learning rate{: .4f}'.format(LEARNING_RATE))
         optimizer = torch.optim.SGD([
             {'params': feature_encoder.feature_layers.parameters(),},
@@ -289,6 +310,7 @@ for iDataSet in range(nDataSet):
         iter_target = iter(train_loader_t)
         num_iter = len_source_loader
         ema_decay = get_ema_decay(epoch) if USE_EMA_TEACHER else 0.0
+        source_con_factor = get_source_con_factor(epoch)
         target_con_weight = 0.0
         effective_target_con_weight = 0.0
 
@@ -502,9 +524,8 @@ for iDataSet in range(nDataSet):
             loss_base = (
                 cls_loss
                 + 0.01 * lambd * lmmd_loss
-                + contrastive_loss_s
+                + source_con_factor * contrastive_loss_s
                 + effective_target_con_weight * contrastive_loss_t
-                + domain_similar_loss
                 + LAMBDA_TMCC * lambd * tmcc_loss
             )
 
@@ -529,7 +550,8 @@ for iDataSet in range(nDataSet):
         print(
             'epoch {:>3d}:   cls loss: {:6.4f}, lmmd loss:{:6f}, con_s loss:{:6f}, '
             'con_t loss:{:6f}, con_t_base loss:{:6f}, con_t_rpls loss:{:6f}, '
-            'rpls con alpha:{:6.4f}, domain loss:{:6f}, tmcc loss:{:6f}, '
+            'source con factor:{:6.4f}, rpls con alpha:{:6.4f}, '
+            'domain loss:{:6f}, tmcc loss:{:6f}, '
             'lmmd rho:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, '
             'effective target con weight:{:6.4f}, base target con num:{:>2d}, '
             'reliable weight mean:{:6.4f}, '
@@ -546,7 +568,7 @@ for iDataSet in range(nDataSet):
             .format(
                 epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
                 contrastive_loss_t.item(), contrastive_loss_t_base.item(),
-                contrastive_loss_t_rpls.item(), rpls_con_alpha,
+                contrastive_loss_t_rpls.item(), source_con_factor, rpls_con_alpha,
                 domain_similar_loss.item(), tmcc_loss.item(), lmmd_rho,
                 target_con_weight, target_con_num, effective_target_con_weight,
                 base_target_con_num, weight_mean, ema_decay,
