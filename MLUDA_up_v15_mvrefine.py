@@ -26,10 +26,21 @@ from UtilsCMS import *
 from rp_utils import update_ema_teacher
 from mv_refine import multiview_refine_pseudo_labels
 
-USE_MVREFINE_V15 = True
-USE_EMA_TEACHER = True
-USE_CB_RPLS = True
-USE_EW_TMCC = False
+USE_INNOVATION1_EMA_MVREFINE = True
+USE_INNOVATION2_RPLS = False
+USE_INNOVATION3_RPLS_ADAPT = False
+
+USE_MVREFINE_V15 = USE_INNOVATION1_EMA_MVREFINE
+USE_EMA_TEACHER = USE_INNOVATION1_EMA_MVREFINE
+USE_CB_RPLS = USE_INNOVATION2_RPLS
+USE_EW_TMCC = True
+USE_LATE_STABILIZATION = True
+
+# Internal switches derived from the three public ablation switches above.
+USE_RPLS_SELECTION = USE_INNOVATION2_RPLS
+USE_RPLS_WEIGHT = USE_INNOVATION2_RPLS
+USE_RPLS_CON = USE_INNOVATION2_RPLS and USE_INNOVATION3_RPLS_ADAPT
+USE_RPLS_LMMD = USE_INNOVATION2_RPLS and USE_INNOVATION3_RPLS_ADAPT
 
 MV_WARMUP_EPOCHS = 20
 
@@ -39,7 +50,7 @@ MV_THRESHOLD_END = 0.70
 MV_PAIR_DELTA = 0.05
 MV_PAIR_WEIGHT = 0.7
 MV_LMMD_BLEND_MAX = 0.3
-RP_EVAL_INTERVAL = 10
+RP_EVAL_INTERVAL = epochs
 
 RPLS_WARMUP_EPOCHS = MV_WARMUP_EPOCHS
 RPLS_LMMD_BLEND_MAX = 0.2
@@ -50,18 +61,18 @@ TGT_CON_WEIGHT_START = 0.5
 TGT_CON_WEIGHT_RAMPUP_EPOCHS = 30
 USE_RESIDUAL_RPLS_CON = True
 RPLS_CON_ALPHA_MAX = 0.2
-USE_RPLS_SOFT_COVERAGE = True
-USE_RPLS_CLASS_RESCUE = True
+USE_RPLS_SOFT_COVERAGE = False
+USE_RPLS_CLASS_RESCUE = False
 USE_CLASS_ADAPTIVE_RPLS_THRESHOLD = True
 RPLS_MIN_RELIABLE_PER_CLASS = 2
 RPLS_CLASS_THRESHOLD_FLOOR = 0.55
 RPLS_CLASS_THRESHOLD_RELAX = 0.08
 RPLS_RESCUE_CONF_MIN = 0.60
 RPLS_RESCUE_WEIGHT_SCALE = 0.5
-USE_RPLS_CROSS_CLASS_RESCUE = True
+USE_RPLS_CROSS_CLASS_RESCUE = False
 RPLS_CROSS_RESCUE_MARGIN_MAX = 0.15
 RPLS_CROSS_RESCUE_WEIGHT_SCALE = 0.35
-USE_RPLS_CLASS_BALANCE = True
+USE_RPLS_CLASS_BALANCE = False
 RPLS_BALANCE_POWER = 0.5
 RPLS_BALANCE_WEIGHT_MIN = 0.5
 RPLS_BALANCE_WEIGHT_MAX = 2.0
@@ -115,7 +126,7 @@ def get_ema_decay(epoch):
     return 0.999 + (EMA_DECAY_LATE - 0.999) * late_progress
 
 def get_late_decay_progress(epoch):
-    if epoch <= LATE_DECAY_START:
+    if (not USE_LATE_STABILIZATION) or epoch <= LATE_DECAY_START:
         return 0.0
     return min(
         1.0,
@@ -418,8 +429,9 @@ best_G,best_RandPerm,best_Row, best_Column,best_nTrain = None,None,None,None,Non
 for iDataSet in range(nDataSet):
     print('#######################idataset######################## ', iDataSet)
     print(
-        'Pavia mvrefine controls: USE_MVREFINE_V15={}, USE_EMA_TEACHER={}, '
-        'USE_CB_RPLS={}, USE_EW_TMCC={}, RPLS_LMMD_BLEND_MAX={}, '
+        'Pavia mvrefine controls: INNO1_EMA_MVREFINE={}, '
+        'INNO2_RPLS={}, INNO3_RPLS_ADAPT={}, '
+        'USE_EW_TMCC={}, USE_LATE_STABILIZATION={}, RPLS_LMMD_BLEND_MAX={}, '
         'LAMBDA_TGT_CON={}, USE_RESIDUAL_RPLS_CON={}, RPLS_CON_ALPHA_MAX={}, '
         'TGT_CON_WEIGHT_START={}, TGT_CON_WEIGHT_RAMPUP_EPOCHS={}, '
         'USE_RPLS_SOFT_COVERAGE={}, USE_RPLS_CLASS_RESCUE={}, '
@@ -432,10 +444,11 @@ for iDataSet in range(nDataSet):
         'LAMBDA_TMCC={}, LATE_DECAY_START={}, LATE_DECAY_END={}, '
         'LATE_LMMD_FACTOR_MIN={}, LATE_TMCC_FACTOR_MIN={}, EMA_DECAY_LATE={}, '
         'LOG_FILE_PATH={}'.format(
-            USE_MVREFINE_V15,
-            USE_EMA_TEACHER,
-            USE_CB_RPLS,
+            USE_INNOVATION1_EMA_MVREFINE,
+            USE_INNOVATION2_RPLS,
+            USE_INNOVATION3_RPLS_ADAPT,
             USE_EW_TMCC,
+            USE_LATE_STABILIZATION,
             RPLS_LMMD_BLEND_MAX,
             LAMBDA_TGT_CON,
             USE_RESIDUAL_RPLS_CON,
@@ -642,27 +655,42 @@ for iDataSet in range(nDataSet):
             # Loss Cls
             cls_loss = crossEntropy(source_outputs, source_label_cuda)
             # Loss Lmmd
-            (
-                balanced_reliable_mask,
-                rescued_sample_weight,
-                balanced_rpls_label,
-                rpls_rescue_stats,
-            ) = build_balanced_reliable_selection(
-                reliable_mask,
-                sample_weight,
-                pseudo_label_t_for_scl,
-                refined_prob
-            )
+            use_rpls_selection = USE_CB_RPLS and USE_RPLS_SELECTION
+            use_rpls_lmmd = use_rpls_selection and USE_RPLS_LMMD
+            use_rpls_con = use_rpls_selection and USE_RPLS_CON
+            use_rpls_weight = use_rpls_selection and USE_RPLS_WEIGHT
+            if use_rpls_selection:
+                (
+                    balanced_reliable_mask,
+                    rescued_sample_weight,
+                    balanced_rpls_label,
+                    rpls_rescue_stats,
+                ) = build_balanced_reliable_selection(
+                    reliable_mask,
+                    sample_weight,
+                    pseudo_label_t_for_scl,
+                    refined_prob
+                )
+            else:
+                balanced_reliable_mask = torch.zeros_like(reliable_mask)
+                rescued_sample_weight = sample_weight.new_zeros(sample_weight.shape)
+                balanced_rpls_label = pseudo_label_t_for_scl
+                rpls_rescue_stats = get_empty_rpls_rescue_stats()
             rpls_rescue_num = rpls_rescue_stats["rpls_rescue_num"]
             rpls_coverage_factor = get_rpls_coverage_factor(
                 balanced_rpls_label,
                 balanced_reliable_mask
             )
-            balanced_sample_weight, rpls_balance_min, rpls_balance_max = get_balanced_rpls_weight(
-                rescued_sample_weight,
-                balanced_rpls_label,
-                balanced_reliable_mask
-            )
+            if use_rpls_weight:
+                balanced_sample_weight, rpls_balance_min, rpls_balance_max = get_balanced_rpls_weight(
+                    rescued_sample_weight,
+                    balanced_rpls_label,
+                    balanced_reliable_mask
+                )
+            else:
+                balanced_sample_weight = rescued_sample_weight.new_zeros(rescued_sample_weight.shape)
+                balanced_sample_weight[balanced_reliable_mask] = 1.0
+                rpls_balance_min, rpls_balance_max = 1.0, 1.0
             lmmd_loss_base = mmd.lmmd(
                 source_features,
                 target_features,
@@ -672,7 +700,7 @@ for iDataSet in range(nDataSet):
                 CLASS_NUM=CLASS_NUM
             )
             if (
-                USE_CB_RPLS
+                use_rpls_lmmd
                 and epoch > RPLS_WARMUP_EPOCHS
                 and balanced_reliable_mask.sum().item() > 0
                 and balanced_sample_weight.detach().sum().item() > 0
@@ -711,13 +739,13 @@ for iDataSet in range(nDataSet):
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
             base_target_con_num = int(pseudo_label_t_student.numel())
-            target_con_num = int(balanced_reliable_mask.sum().item()) if USE_CB_RPLS else base_target_con_num
+            target_con_num = int(balanced_reliable_mask.sum().item()) if use_rpls_selection else base_target_con_num
             contrastive_loss_t_base = ContrastiveLoss_t(
                 all_target_con_features,
                 pseudo_label_t_student
             )
 
-            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS and balanced_reliable_mask.sum().item() >= 2:
+            if use_rpls_con and epoch > RPLS_WARMUP_EPOCHS and balanced_reliable_mask.sum().item() >= 2:
                 contrastive_loss_t_rpls = ContrastiveLoss_t(
                     all_target_con_features[balanced_reliable_mask],
                     balanced_rpls_label[balanced_reliable_mask],
@@ -728,7 +756,7 @@ for iDataSet in range(nDataSet):
                 contrastive_loss_t_rpls = target_features.new_tensor(0.0)
                 has_valid_rpls_con = False
 
-            if USE_CB_RPLS and USE_RESIDUAL_RPLS_CON and has_valid_rpls_con:
+            if use_rpls_con and USE_RESIDUAL_RPLS_CON and has_valid_rpls_con:
                 rpls_con_progress = min(
                     1.0,
                     max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
@@ -745,7 +773,7 @@ for iDataSet in range(nDataSet):
             domain_similar_loss = DSH_loss(source_out, target_out)
 
             if USE_EW_TMCC and epoch > TMCC_WARMUP_EPOCHS:
-                if USE_CB_RPLS and balanced_reliable_mask.sum().item() > 0:
+                if use_rpls_selection and balanced_reliable_mask.sum().item() > 0:
                     tmcc_loss = entropy_weighted_mcc_loss(
                         target_outputs,
                         temperature=TMCC_TEMPERATURE,
@@ -776,7 +804,6 @@ for iDataSet in range(nDataSet):
                 + 0.3 * lambd * lmmd_loss
                 + contrastive_loss_s
                 + target_con_weight * contrastive_loss_t
-              # + domain_similar_loss
                 + tmcc_weight * lambd * tmcc_loss
             )
 
@@ -846,7 +873,7 @@ for iDataSet in range(nDataSet):
         )
 
         train_end = time.time()
-        if epoch % RP_EVAL_INTERVAL == 0 or epoch == epochs:
+        if epoch % RP_EVAL_INTERVAL == 0:
             print('Testing epoch {} ...'.format(epoch))
             student_result = evaluate_target_domain(feature_encoder, test_loader, source_data)
             student_acc[iDataSet] = student_result['oa']
@@ -871,8 +898,9 @@ for iDataSet in range(nDataSet):
                 print("save student networks for epoch:", epoch + 1)
                 last_student_accuracy = student_result['oa']
                 best_student_episdoe = epoch
-                best_predict_all = student_result['predict']
-                best_G, best_RandPerm, best_Row, best_Column = G, RandPerm, Row, Column
+                if not USE_EMA_TEACHER:
+                    best_predict_all = student_result['predict']
+                    best_G, best_RandPerm, best_Row, best_Column = G, RandPerm, Row, Column
                 print('best student epoch:[{}], best student accuracy={}'.format(
                     best_student_episdoe + 1,
                     last_student_accuracy
@@ -882,6 +910,8 @@ for iDataSet in range(nDataSet):
                 print("save teacher networks for epoch:", epoch + 1)
                 last_teacher_accuracy = teacher_result['oa']
                 best_teacher_episdoe = epoch
+                best_predict_all = teacher_result['predict']
+                best_G, best_RandPerm, best_Row, best_Column = G, RandPerm, Row, Column
                 print('best teacher epoch:[{}], best teacher accuracy={}'.format(
                     best_teacher_episdoe + 1,
                     last_teacher_accuracy
@@ -902,16 +932,11 @@ for iDataSet in range(nDataSet):
 
 print ("train time per DataSet(s): " + "{:.5f}".format(train_end-train_start))
 print("test time per DataSet(s): " + "{:.5f}".format(test_end-train_end))
-print_average_result('Student', student_acc, student_A, student_k)
 if USE_EMA_TEACHER:
     print_average_result('Teacher', teacher_acc, teacher_A, teacher_k)
-
-best_iDataset = 0
-for i in range(len(student_acc)):
-    print('{}:{}'.format(i, student_acc[i]))
-    if student_acc[i] > student_acc[best_iDataset]:
-        best_iDataset = i
-print('best student acc all={}'.format(student_acc[best_iDataset]))
+    print_average_result('Student', student_acc, student_A, student_k)
+else:
+    print_average_result('Student', student_acc, student_A, student_k)
 
 if USE_EMA_TEACHER:
     best_teacher_iDataset = 0
@@ -919,7 +944,21 @@ if USE_EMA_TEACHER:
         print('teacher {}:{}'.format(i, teacher_acc[i]))
         if teacher_acc[i] > teacher_acc[best_teacher_iDataset]:
             best_teacher_iDataset = i
-    print('best teacher acc all={}'.format(teacher_acc[best_teacher_iDataset]))
+    print('best primary teacher acc all={}'.format(teacher_acc[best_teacher_iDataset]))
+
+    best_student_iDataset = 0
+    for i in range(len(student_acc)):
+        print('student(reference) {}:{}'.format(i, student_acc[i]))
+        if student_acc[i] > student_acc[best_student_iDataset]:
+            best_student_iDataset = i
+    print('best reference student acc all={}'.format(student_acc[best_student_iDataset]))
+else:
+    best_student_iDataset = 0
+    for i in range(len(student_acc)):
+        print('student {}:{}'.format(i, student_acc[i]))
+        if student_acc[i] > student_acc[best_student_iDataset]:
+            best_student_iDataset = i
+    print('best primary student acc all={}'.format(student_acc[best_student_iDataset]))
 
 #################classification map################################
 

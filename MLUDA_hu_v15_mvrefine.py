@@ -24,10 +24,21 @@ from UtilsCMS import *
 from rp_utils import update_ema_teacher
 from mv_refine import multiview_refine_pseudo_labels
 
-USE_MVREFINE_V15 = True
-USE_EMA_TEACHER = True
-USE_CB_RPLS = True
+USE_INNOVATION1_EMA_MVREFINE = True
+USE_INNOVATION2_RPLS = False
+USE_INNOVATION3_RPLS_ADAPT = False
+
+USE_MVREFINE_V15 = USE_INNOVATION1_EMA_MVREFINE
+USE_EMA_TEACHER = USE_INNOVATION1_EMA_MVREFINE
+USE_CB_RPLS = USE_INNOVATION2_RPLS
 USE_EW_TMCC = True
+USE_LATE_STABILIZATION = True
+
+# Internal switches derived from the three public ablation switches above.
+USE_RPLS_SELECTION = USE_INNOVATION2_RPLS
+USE_RPLS_WEIGHT = USE_INNOVATION2_RPLS
+USE_RPLS_CON = USE_INNOVATION2_RPLS and USE_INNOVATION3_RPLS_ADAPT
+USE_RPLS_LMMD = USE_INNOVATION2_RPLS and USE_INNOVATION3_RPLS_ADAPT
 
 MV_WARMUP_EPOCHS = 20
 MV_THRESHOLD_START = 0.80
@@ -45,6 +56,12 @@ LAMBDA_TMCC = 0.01
 TMCC_TEMPERATURE = 2.5
 TMCC_WARMUP_EPOCHS = 20
 
+LATE_DECAY_START = 80
+LATE_DECAY_END = 100
+LATE_LMMD_FACTOR_MIN = 0.25
+LATE_TMCC_FACTOR_MIN = 0.3
+EMA_DECAY_LATE = 0.9992
+
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
     return torch.frombuffer(array, dtype=torch_dtype).reshape(array.shape)
@@ -54,7 +71,22 @@ def get_ema_decay(epoch):
         return 0.99
     if epoch <= 50:
         return 0.995
-    return 0.999
+    late_progress = get_late_decay_progress(epoch)
+    return 0.999 + (EMA_DECAY_LATE - 0.999) * late_progress
+
+def get_late_decay_progress(epoch):
+    if (not USE_LATE_STABILIZATION) or epoch <= LATE_DECAY_START:
+        return 0.0
+    return min(
+        1.0,
+        max(0.0, (epoch - LATE_DECAY_START) / max(1, LATE_DECAY_END - LATE_DECAY_START))
+    )
+
+def get_late_decay_factors(epoch):
+    late_progress = get_late_decay_progress(epoch)
+    late_lmmd_factor = 1.0 - (1.0 - LATE_LMMD_FACTOR_MIN) * late_progress
+    late_tmcc_factor = 1.0 - (1.0 - LATE_TMCC_FACTOR_MIN) * late_progress
+    return late_progress, late_lmmd_factor, late_tmcc_factor
 
 def entropy_weighted_mcc_loss(logits, temperature=2.5, sample_weight=None, eps=1e-6):
     prob = F.softmax(logits / temperature, dim=1)
@@ -195,6 +227,29 @@ best_G,best_RandPerm,best_Row, best_Column,best_nTrain = None,None,None,None,Non
 
 for iDataSet in range(nDataSet):
     print('#######################idataset######################## ', iDataSet)
+    print(
+        'HU v15 controls: INNO1_EMA_MVREFINE={}, '
+        'INNO2_RPLS={}, INNO3_RPLS_ADAPT={}, '
+        'USE_EW_TMCC={}, USE_LATE_STABILIZATION={}, LAMBDA_TGT_CON={}, '
+        'RPLS_LMMD_BLEND_MAX={}, LAMBDA_TMCC={}, '
+        'LATE_DECAY_START={}, LATE_DECAY_END={}, '
+        'LATE_LMMD_FACTOR_MIN={}, LATE_TMCC_FACTOR_MIN={}, '
+        'EMA_DECAY_LATE={}'.format(
+            USE_INNOVATION1_EMA_MVREFINE,
+            USE_INNOVATION2_RPLS,
+            USE_INNOVATION3_RPLS_ADAPT,
+            USE_EW_TMCC,
+            USE_LATE_STABILIZATION,
+            LAMBDA_TGT_CON,
+            RPLS_LMMD_BLEND_MAX,
+            LAMBDA_TMCC,
+            LATE_DECAY_START,
+            LATE_DECAY_END,
+            LATE_LMMD_FACTOR_MIN,
+            LATE_TMCC_FACTOR_MIN,
+            EMA_DECAY_LATE
+        )
+    )
     utils.set_seed(seeds[iDataSet])
 
     trainX, trainY = utils.get_sample_data(data_s, label_s, HalfWidth, 180)
@@ -268,6 +323,7 @@ for iDataSet in range(nDataSet):
         num_iter = len_source_loader
         ema_decay = get_ema_decay(epoch) if USE_EMA_TEACHER else 0.0
         target_con_weight = 0.0
+        late_progress, late_lmmd_factor, late_tmcc_factor = get_late_decay_factors(epoch)
 
         for i in range(1,num_iter):
             source_data, source_label = next(iter_source)
@@ -379,18 +435,31 @@ for iDataSet in range(nDataSet):
                 BATCH_SIZE=BATCH_SIZE,
                 CLASS_NUM=CLASS_NUM
             )
+            use_rpls_selection = USE_CB_RPLS and USE_RPLS_SELECTION
+            use_rpls_lmmd = use_rpls_selection and USE_RPLS_LMMD
+            use_rpls_con = use_rpls_selection and USE_RPLS_CON
+            use_rpls_weight = use_rpls_selection and USE_RPLS_WEIGHT
+            if use_rpls_selection:
+                rpls_reliable_mask = reliable_mask
+            else:
+                rpls_reliable_mask = torch.zeros_like(reliable_mask)
+            if use_rpls_weight:
+                rpls_sample_weight = sample_weight
+            else:
+                rpls_sample_weight = sample_weight.new_zeros(sample_weight.shape)
+                rpls_sample_weight[rpls_reliable_mask] = 1.0
             if (
-                USE_CB_RPLS
+                use_rpls_lmmd
                 and epoch > RPLS_WARMUP_EPOCHS
-                and reliable_mask.sum().item() > 0
-                and sample_weight.detach().sum().item() > 0
+                and rpls_reliable_mask.sum().item() > 0
+                and rpls_sample_weight.detach().sum().item() > 0
             ):
                 lmmd_loss_reliable = mmd.weighted_lmmd(
                     source_features,
                     target_features,
                     source_label,
                     refined_prob.detach(),
-                    t_weight=sample_weight.detach(),
+                    t_weight=rpls_sample_weight.detach(),
                     BATCH_SIZE=BATCH_SIZE,
                     CLASS_NUM=CLASS_NUM
                 )
@@ -401,12 +470,13 @@ for iDataSet in range(nDataSet):
                     1.0,
                     max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, epochs - RPLS_WARMUP_EPOCHS))
                 )
-                lmmd_rho = RPLS_LMMD_BLEND_MAX * rpls_progress
+                lmmd_rho = RPLS_LMMD_BLEND_MAX * rpls_progress * late_lmmd_factor
                 lmmd_loss = (1.0 - lmmd_rho) * lmmd_loss_base + lmmd_rho * lmmd_loss_reliable
             else:
                 lmmd_loss = lmmd_loss_base
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
-            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS:
+            tmcc_weight = LAMBDA_TMCC * late_tmcc_factor
+            if use_rpls_con and epoch > RPLS_WARMUP_EPOCHS:
                 target_con_progress = min(
                     1.0,
                     max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
@@ -417,13 +487,13 @@ for iDataSet in range(nDataSet):
             # Loss Con_s
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)
             # Loss Con_t
-            if USE_CB_RPLS:
-                target_con_num = int(reliable_mask.sum().item()) if epoch > RPLS_WARMUP_EPOCHS else 0
-                if epoch > RPLS_WARMUP_EPOCHS and reliable_mask.sum().item() >= 2:
+            if use_rpls_con:
+                target_con_num = int(rpls_reliable_mask.sum().item()) if epoch > RPLS_WARMUP_EPOCHS else 0
+                if epoch > RPLS_WARMUP_EPOCHS and rpls_reliable_mask.sum().item() >= 2:
                     contrastive_loss_t = ContrastiveLoss_t(
-                        all_target_con_features[reliable_mask],
-                        pseudo_label_t_for_scl[reliable_mask],
-                        sample_weight=sample_weight[reliable_mask]
+                        all_target_con_features[rpls_reliable_mask],
+                        pseudo_label_t_for_scl[rpls_reliable_mask],
+                        sample_weight=rpls_sample_weight[rpls_reliable_mask]
                     )
                 else:
                     contrastive_loss_t = target_features.new_tensor(0.0)
@@ -437,11 +507,11 @@ for iDataSet in range(nDataSet):
             domain_similar_loss = DSH_loss(source_out, target_out)
 
             if USE_EW_TMCC and epoch > TMCC_WARMUP_EPOCHS:
-                if USE_CB_RPLS and reliable_mask.sum().item() > 0:
+                if use_rpls_selection and rpls_reliable_mask.sum().item() > 0:
                     tmcc_loss = entropy_weighted_mcc_loss(
                         target_outputs,
                         temperature=TMCC_TEMPERATURE,
-                        sample_weight=sample_weight
+                        sample_weight=rpls_sample_weight
                     )
                 else:
                     tmcc_loss = entropy_weighted_mcc_loss(
@@ -452,8 +522,8 @@ for iDataSet in range(nDataSet):
             else:
                 tmcc_loss = target_features.new_tensor(0.0)
 
-            if reliable_mask.sum().item() > 0:
-                weight_mean = float(sample_weight[reliable_mask].mean().item())
+            if rpls_reliable_mask.sum().item() > 0:
+                weight_mean = float(rpls_sample_weight[rpls_reliable_mask].mean().item())
             else:
                 weight_mean = 0.0
 
@@ -463,7 +533,7 @@ for iDataSet in range(nDataSet):
                 + contrastive_loss_s
                 + target_con_weight * contrastive_loss_t
                 + domain_similar_loss
-                + LAMBDA_TMCC * lambd * tmcc_loss
+                + tmcc_weight * lambd * tmcc_loss
             )
 
             loss = loss_base
@@ -484,9 +554,10 @@ for iDataSet in range(nDataSet):
 
             test_accuracy = 100. * float(total_hit) / size
 
-        print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, tmcc loss:{:6f}, lmmd rho:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, reliable weight mean:{:6.4f}, ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted num:{:>2d}, class cap:{:>2d}, accepted nz:{:>2d}, accepted top:{:6.4f}, accepted weight mean:{:6.4f}, candidate num:{:>2d}, candidate ratio:{:6.4f}, per class k:{:>2d}, topk ratio:{:6.4f}, ts agree:{:>2d}, teacher stronger:{:>2d}, rejected disagree:{:>2d}, student nz:{:>2d}, refined nz:{:>2d}, student top:{:6.4f}, refined top:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student hist:{}, refined hist:{}, accepted hist:{}'
+        print('epoch {:>3d}:   cls loss: {:6.4f},lmmd loss:{:6f},con_s loss:{:6f}, con_t loss:{:6f}, domain loss:{:6f}, tmcc loss:{:6f}, tmcc weight:{:6.4f}, lmmd rho:{:6.4f}, late progress:{:6.4f}, late lmmd factor:{:6.4f}, late tmcc factor:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, reliable weight mean:{:6.4f}, ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, triple num:{:>2d}, pair num:{:>2d}, reliable num:{:>2d}, reliable ratio:{:6.4f}, guard reject:{}, accepted num:{:>2d}, class cap:{:>2d}, accepted nz:{:>2d}, accepted top:{:6.4f}, accepted weight mean:{:6.4f}, candidate num:{:>2d}, candidate ratio:{:6.4f}, per class k:{:>2d}, topk ratio:{:6.4f}, ts agree:{:>2d}, teacher stronger:{:>2d}, rejected disagree:{:>2d}, student nz:{:>2d}, refined nz:{:>2d}, student top:{:6.4f}, refined top:{:6.4f}, acc {:6.4f}, total loss: {:6.4f}, student hist:{}, refined hist:{}, accepted hist:{}'
               .format(epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
-               contrastive_loss_t.item(), domain_similar_loss.item(), tmcc_loss.item(), lmmd_rho,
+               contrastive_loss_t.item(), domain_similar_loss.item(), tmcc_loss.item(),
+               tmcc_weight, lmmd_rho, late_progress, late_lmmd_factor, late_tmcc_factor,
                target_con_weight, target_con_num, weight_mean, ema_decay,
                mv_stats['threshold'], mv_stats['pair_threshold'],
                mv_stats['triple_num'], mv_stats['pair_num'],

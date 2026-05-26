@@ -33,9 +33,9 @@ from mv_refine import multiview_refine_pseudo_labels
 USE_MVREFINE_V15 = True
 USE_EMA_TEACHER = True
 USE_CB_RPLS = True
-USE_EW_TMCC = False
+USE_EW_TMCC = True
 
-MV_WARMUP_EPOCHS = 40
+MV_WARMUP_EPOCHS = 20
 
 MV_THRESHOLD_START = 0.80
 MV_THRESHOLD_END = 0.65
@@ -44,22 +44,31 @@ MV_PAIR_DELTA = 0.05
 MV_PAIR_WEIGHT = 0.7
 MV_LMMD_BLEND_MAX = 0.3
 
-RP_EVAL_INTERVAL = 10
+RP_EVAL_INTERVAL = epochs
 
 RPLS_WARMUP_EPOCHS = MV_WARMUP_EPOCHS
-RPLS_LMMD_BLEND_MAX = 0.01
+RPLS_LMMD_BLEND_MAX = 0.1
 
-LAMBDA_TGT_CON = 0.3
-TGT_CON_RAMPUP_EPOCHS = 80
+LAMBDA_TGT_CON = 1.0
+TGT_CON_RAMPUP_EPOCHS = 30
 USE_RESIDUAL_RPLS_CON = True
-RPLS_CON_ALPHA_MAX = 0.05
-LAMBDA_TMCC = 0.003
+RPLS_CON_ALPHA_MAX = 0.3
+
+LAMBDA_TMCC = 0.005
 TMCC_TEMPERATURE = 2.5
-TMCC_WARMUP_EPOCHS = 40
+TMCC_WARMUP_EPOCHS = 30
+
+LATE_DECAY_START = 80
+LATE_DECAY_END = 100
+LATE_LMMD_FACTOR_MIN = 0.25
+LATE_TMCC_FACTOR_MIN = 0.3
+EMA_DECAY_LATE = 0.9992
 
 SOURCE_CON_DECAY_START = 20
 SOURCE_CON_DECAY_END = 60
-SOURCE_CON_FACTOR_MIN = 0.3
+SOURCE_CON_FACTOR_MIN = 1
+
+TARGET_CON_WEIGHT_START = 0.3
 
 def numpy_to_tensor(data, numpy_dtype, torch_dtype):
     array = np.ascontiguousarray(data, dtype=numpy_dtype)
@@ -70,7 +79,22 @@ def get_ema_decay(epoch):
         return 0.99
     if epoch <= 50:
         return 0.995
-    return 0.999
+    late_progress = get_late_decay_progress(epoch)
+    return 0.999 + (EMA_DECAY_LATE - 0.999) * late_progress
+
+def get_late_decay_progress(epoch):
+    if epoch <= LATE_DECAY_START:
+        return 0.0
+    return min(
+        1.0,
+        max(0.0, (epoch - LATE_DECAY_START) / max(1, LATE_DECAY_END - LATE_DECAY_START))
+    )
+
+def get_late_decay_factors(epoch):
+    late_progress = get_late_decay_progress(epoch)
+    late_lmmd_factor = 1.0 - (1.0 - LATE_LMMD_FACTOR_MIN) * late_progress
+    late_tmcc_factor = 1.0 - (1.0 - LATE_TMCC_FACTOR_MIN) * late_progress
+    return late_progress, late_lmmd_factor, late_tmcc_factor
 
 def get_source_con_factor(epoch):
     if epoch <= SOURCE_CON_DECAY_START:
@@ -84,6 +108,13 @@ def get_source_con_factor(epoch):
         )
     )
     return 1.0 - (1.0 - SOURCE_CON_FACTOR_MIN) * progress
+
+def get_target_con_weight(epoch):
+    progress = min(
+        1.0,
+        max(0.0, (epoch - 1) / max(1, TGT_CON_RAMPUP_EPOCHS - 1))
+    )
+    return TARGET_CON_WEIGHT_START + (LAMBDA_TGT_CON - TARGET_CON_WEIGHT_START) * progress
 
 def entropy_weighted_mcc_loss(logits, temperature=2.5, sample_weight=None, eps=1e-6):
     prob = F.softmax(logits / temperature, dim=1)
@@ -224,7 +255,11 @@ for iDataSet in range(nDataSet):
         'USE_CB_RPLS={}, USE_EW_TMCC={}, LAMBDA_TGT_CON={}, '
         'USE_RESIDUAL_RPLS_CON={}, RPLS_CON_ALPHA_MAX={}, '
         'RPLS_LMMD_BLEND_MAX={}, SOURCE_CON_DECAY_START={}, '
-        'SOURCE_CON_DECAY_END={}, SOURCE_CON_FACTOR_MIN={}'.format(
+        'SOURCE_CON_DECAY_END={}, SOURCE_CON_FACTOR_MIN={}, '
+        'TARGET_CON_WEIGHT_START={}, LAMBDA_TMCC={}, '
+        'LATE_DECAY_START={}, LATE_DECAY_END={}, '
+        'LATE_LMMD_FACTOR_MIN={}, LATE_TMCC_FACTOR_MIN={}, '
+        'EMA_DECAY_LATE={}'.format(
             USE_MVREFINE_V15,
             USE_EMA_TEACHER,
             USE_CB_RPLS,
@@ -235,7 +270,14 @@ for iDataSet in range(nDataSet):
             RPLS_LMMD_BLEND_MAX,
             SOURCE_CON_DECAY_START,
             SOURCE_CON_DECAY_END,
-            SOURCE_CON_FACTOR_MIN
+            SOURCE_CON_FACTOR_MIN,
+            TARGET_CON_WEIGHT_START,
+            LAMBDA_TMCC,
+            LATE_DECAY_START,
+            LATE_DECAY_END,
+            LATE_LMMD_FACTOR_MIN,
+            LATE_TMCC_FACTOR_MIN,
+            EMA_DECAY_LATE
         )
     )
     utils.set_seed(seeds[iDataSet])
@@ -313,6 +355,7 @@ for iDataSet in range(nDataSet):
         source_con_factor = get_source_con_factor(epoch)
         target_con_weight = 0.0
         effective_target_con_weight = 0.0
+        late_progress, late_lmmd_factor, late_tmcc_factor = get_late_decay_factors(epoch)
 
         for i in range(1,num_iter):
             source_data, source_label = next(iter_source)
@@ -446,17 +489,14 @@ for iDataSet in range(nDataSet):
                     1.0,
                     max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, epochs - RPLS_WARMUP_EPOCHS))
                 )
-                lmmd_rho = RPLS_LMMD_BLEND_MAX * rpls_progress
+                lmmd_rho = RPLS_LMMD_BLEND_MAX * rpls_progress * late_lmmd_factor
                 lmmd_loss = (1.0 - lmmd_rho) * lmmd_loss_base + lmmd_rho * lmmd_loss_reliable
             else:
                 lmmd_loss = lmmd_loss_base
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
-            if USE_CB_RPLS and epoch > RPLS_WARMUP_EPOCHS:
-                target_con_progress = min(
-                    1.0,
-                    max(0.0, (epoch - RPLS_WARMUP_EPOCHS) / max(1, TGT_CON_RAMPUP_EPOCHS))
-                )
-                target_con_weight = LAMBDA_TGT_CON * target_con_progress
+            tmcc_weight = LAMBDA_TMCC * late_tmcc_factor
+            if USE_CB_RPLS:
+                target_con_weight = get_target_con_weight(epoch)
             else:
                 target_con_weight = 0.0
             effective_target_con_weight = target_con_weight
@@ -526,7 +566,7 @@ for iDataSet in range(nDataSet):
                 + 0.01 * lambd * lmmd_loss
                 + source_con_factor * contrastive_loss_s
                 + effective_target_con_weight * contrastive_loss_t
-                + LAMBDA_TMCC * lambd * tmcc_loss
+                + tmcc_weight * lambd * tmcc_loss
             )
 
             loss = loss_base
@@ -552,7 +592,10 @@ for iDataSet in range(nDataSet):
             'con_t loss:{:6f}, con_t_base loss:{:6f}, con_t_rpls loss:{:6f}, '
             'source con factor:{:6.4f}, rpls con alpha:{:6.4f}, '
             'domain loss:{:6f}, tmcc loss:{:6f}, '
-            'lmmd rho:{:6.4f}, target con weight:{:6.4f}, target con num:{:>2d}, '
+            'tmcc weight:{:6.4f}, lmmd rho:{:6.4f}, '
+            'late progress:{:6.4f}, late lmmd factor:{:6.4f}, '
+            'late tmcc factor:{:6.4f}, '
+            'target con weight:{:6.4f}, target con num:{:>2d}, '
             'effective target con weight:{:6.4f}, base target con num:{:>2d}, '
             'reliable weight mean:{:6.4f}, '
             'ema decay:{:6.4f}, threshold:{:6.4f}, pair threshold:{:6.4f}, '
@@ -569,7 +612,9 @@ for iDataSet in range(nDataSet):
                 epoch, cls_loss.item(), lmmd_loss.item(), contrastive_loss_s.item(),
                 contrastive_loss_t.item(), contrastive_loss_t_base.item(),
                 contrastive_loss_t_rpls.item(), source_con_factor, rpls_con_alpha,
-                domain_similar_loss.item(), tmcc_loss.item(), lmmd_rho,
+                domain_similar_loss.item(), tmcc_loss.item(),
+                tmcc_weight, lmmd_rho, late_progress,
+                late_lmmd_factor, late_tmcc_factor,
                 target_con_weight, target_con_num, effective_target_con_weight,
                 base_target_con_num, weight_mean, ema_decay,
                 mv_stats['threshold'], mv_stats['pair_threshold'],
@@ -588,7 +633,7 @@ for iDataSet in range(nDataSet):
         )
 
         train_end = time.time()
-        if epoch % RP_EVAL_INTERVAL == 0 or epoch == epochs:
+        if epoch % RP_EVAL_INTERVAL == 0:
             print('Testing epoch {} ...'.format(epoch))
             student_result = evaluate_target_domain(feature_encoder, test_loader, source_data)
             student_acc[iDataSet] = student_result['oa']
@@ -613,8 +658,9 @@ for iDataSet in range(nDataSet):
                 print("save student networks for epoch:", epoch + 1)
                 last_student_accuracy = student_result['oa']
                 best_student_episdoe = epoch
-                best_predict_all = student_result['predict']
-                best_G, best_RandPerm, best_Row, best_Column = G, RandPerm, Row, Column
+                if not USE_EMA_TEACHER:
+                    best_predict_all = student_result['predict']
+                    best_G, best_RandPerm, best_Row, best_Column = G, RandPerm, Row, Column
                 print('best student epoch:[{}], best student accuracy={}'.format(
                     best_student_episdoe + 1,
                     last_student_accuracy
@@ -624,6 +670,8 @@ for iDataSet in range(nDataSet):
                 print("save teacher networks for epoch:", epoch + 1)
                 last_teacher_accuracy = teacher_result['oa']
                 best_teacher_episdoe = epoch
+                best_predict_all = teacher_result['predict']
+                best_G, best_RandPerm, best_Row, best_Column = G, RandPerm, Row, Column
                 print('best teacher epoch:[{}], best teacher accuracy={}'.format(
                     best_teacher_episdoe + 1,
                     last_teacher_accuracy
@@ -644,16 +692,11 @@ for iDataSet in range(nDataSet):
 
 print ("train time per DataSet(s): " + "{:.5f}".format(train_end-train_start))
 print("test time per DataSet(s): " + "{:.5f}".format(test_end-train_end))
-print_average_result('Student', student_acc, student_A, student_k)
 if USE_EMA_TEACHER:
     print_average_result('Teacher', teacher_acc, teacher_A, teacher_k)
-
-best_iDataset = 0
-for i in range(len(student_acc)):
-    print('{}:{}'.format(i, student_acc[i]))
-    if student_acc[i] > student_acc[best_iDataset]:
-        best_iDataset = i
-print('best student acc all={}'.format(student_acc[best_iDataset]))
+    print_average_result('Student', student_acc, student_A, student_k)
+else:
+    print_average_result('Student', student_acc, student_A, student_k)
 
 if USE_EMA_TEACHER:
     best_teacher_iDataset = 0
@@ -661,7 +704,21 @@ if USE_EMA_TEACHER:
         print('teacher {}:{}'.format(i, teacher_acc[i]))
         if teacher_acc[i] > teacher_acc[best_teacher_iDataset]:
             best_teacher_iDataset = i
-    print('best teacher acc all={}'.format(teacher_acc[best_teacher_iDataset]))
+    print('best primary teacher acc all={}'.format(teacher_acc[best_teacher_iDataset]))
+
+    best_student_iDataset = 0
+    for i in range(len(student_acc)):
+        print('student(reference) {}:{}'.format(i, student_acc[i]))
+        if student_acc[i] > student_acc[best_student_iDataset]:
+            best_student_iDataset = i
+    print('best reference student acc all={}'.format(student_acc[best_student_iDataset]))
+else:
+    best_student_iDataset = 0
+    for i in range(len(student_acc)):
+        print('student {}:{}'.format(i, student_acc[i]))
+        if student_acc[i] > student_acc[best_student_iDataset]:
+            best_student_iDataset = i
+    print('best primary student acc all={}'.format(student_acc[best_student_iDataset]))
 
 #################classification map################################
 
